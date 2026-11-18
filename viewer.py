@@ -3285,11 +3285,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.show_toast(f"<b style='color:{ACCENT}'>{os.path.basename(path)}</b> saved")
 
     def export_mp4(self):
-        try:
-            import imageio
-        except ImportError:
-            QtWidgets.QMessageBox.warning(self, APP, "The .mp4 export needs imageio and imageio-ffmpeg (pip install -r requirements.txt).")
-            return
+        from video import Mp4Writer
         suggested = os.path.join(self._last_folder, f"{self.project.name}.mp4")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export .mp4", suggested, "MPEG-4 video (*.mp4)")
         if not path:
@@ -3315,7 +3311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cancelled = False
         writer = None
         try:
-            writer = imageio.get_writer(path, format="FFMPEG", fps=FPS, codec="libx264", quality=8, pixelformat="yuv420p", macro_block_size=16)
+            writer = Mp4Writer(path, width, height, FPS)
             for frame in range(last + 1):
                 if progress.wasCanceled():
                     cancelled = True
@@ -3326,7 +3322,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     free.update_game(*pose)
                 else:
                     free.update_orbit()
-                writer.append_data(offscreen.render(scene, free, frame, width, height,
+                writer.append(offscreen.render(scene, free, frame, width, height,
                                                     layers=self.project.layers_at(frame)))
                 progress.setValue(frame + 1)
                 QtWidgets.QApplication.processEvents()

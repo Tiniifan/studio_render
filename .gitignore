@@ -25,3 +25,4 @@ out/
 
 # Local documents
 docs/
+/build_venv

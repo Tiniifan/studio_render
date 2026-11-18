@@ -26,6 +26,18 @@ STUDIO_ELEVEN_IMPORTS = ("bisect", "collections", "enum", "functools", "hashlib"
                          "platform", "random", "shutil", "struct", "tempfile", "warnings", "weakref", "zipfile", "zlib")
 # Not shipped: what the installer unpacks and the caches
 SKIPPED = ("__pycache__", "installed.json")
+# Never imported by studio_render, but PyInstaller follows the optional imports of numpy, PIL, imageio... of the Python
+# that builds: without them the zip is about 3 times bigger. imageio is only the .mp4 fallback off Windows (video.py), on
+# Windows the export uses Media Foundation: the 100 MB ffmpeg of imageio-ffmpeg is not shipped.
+EXCLUDED_MODULES = ("imageio", "imageio_ffmpeg", "cv2", "av", "matplotlib", "tkinter", "_tkinter", "lxml", "yaml",
+                    "scipy", "pandas", "IPython", "jedi", "contourpy", "kiwisolver", "dateutil", "certifi",
+                    "charset_normalizer", "requests", "urllib3", "win32com", "pythoncom", "pywintypes", "setuptools",
+                    "pkg_resources", "PIL.ImageTk", "PIL._imagingtk", "PIL.AvifImagePlugin", "PIL._avif",
+                    "PySide6.QtNetwork", "unittest", "pydoc", "doctest", "xmlrpc", "lib2to3")
+# Qt files the application does not use: the software OpenGL (moderngl needs the driver of the GPU anyway), the
+# translations of Qt (the interface is in English), the network and touch plugins, the platforms other than windows
+QT_REMOVED = ("opengl32sw.dll", "translations", "Qt6Network.dll", "plugins/tls", "plugins/networkinformation",
+              "plugins/generic", "plugins/platforms/qdirect2d.dll", "plugins/platforms/qminimal.dll")
 
 
 def studio_eleven_copy(target):
@@ -55,16 +67,24 @@ def main():
 
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--onedir",
                "--name", NAME, "--distpath", release, "--workpath", work, "--specpath", work,
-               "--paths", ROOT, "--collect-submodules", "glcontext", "--collect-data", "imageio_ffmpeg",
-               "--copy-metadata", "imageio"]
+               "--paths", ROOT, "--collect-submodules", "glcontext"]
     for name in STUDIO_ELEVEN_IMPORTS:
         command += ["--hidden-import", name]
+    for name in EXCLUDED_MODULES:
+        command += ["--exclude-module", name]
     command.append(os.path.join(ROOT, "main.py"))
     print(" ".join(command))
     subprocess.run(command, check=True, cwd=ROOT)
 
     application = os.path.join(release, NAME)
     internal = os.path.join(application, "_internal")
+    qt = os.path.join(internal, "PySide6")
+    for name in QT_REMOVED:
+        path = os.path.join(qt, *name.split("/"))
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
     studio_eleven_copy(os.path.join(internal, "studio_eleven"))
     for folder in ("icons", "fonts", "tools"):
         shutil.copytree(os.path.join(ROOT, folder), os.path.join(internal, folder),
@@ -74,7 +94,7 @@ def main():
     shutil.copy2(os.path.join(ROOT, "studio_eleven", "LICENSE"), os.path.join(application, "LICENSE_studio_eleven"))
 
     archive = os.path.join(release, NAME + ".zip")
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as stream:
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as stream:
         for folder, _, files in os.walk(application):
             for file_name in files:
                 path = os.path.join(folder, file_name)

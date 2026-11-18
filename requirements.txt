@@ -2,5 +2,6 @@ numpy>=1.24
 moderngl>=5.8
 PySide6>=6.5
 Pillow>=9.0
-imageio>=2.31
-imageio-ffmpeg>=0.5
+# .mp4 export off Windows only (on Windows it uses Media Foundation, video.py)
+imageio>=2.31; sys_platform != "win32"
+imageio-ffmpeg>=0.5; sys_platform != "win32"
