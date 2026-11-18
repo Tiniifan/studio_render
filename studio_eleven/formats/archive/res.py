@@ -1,0 +1,894 @@
+import io
+from zlib import crc32
+from struct import pack, unpack, unpack_from, Struct
+
+from enum import Enum
+from ...compression import *
+
+##########################################
+# RESType
+##########################################
+
+class RESType(Enum):
+    BONE = 110
+    TEXPROJ = 140
+    PROPERTIES = 200
+    SHADING = 120
+    MATERIAL_1 = 220
+    MATERIAL_2 = 230
+    MESH_NAME = 100
+    MESH_GROUP = 210
+    TEXTURE_DATA = 240
+    MATERIAL_DATA = 290
+    ANIMATION_MTN2 = 300
+    ANIMATION_MTN3 = 301
+    ANIMATION_IMM2 = 310
+    ANIMATION_MTM2 = 320
+    MTNINF = 400
+    MTNINF2 = 401
+    IMMINF = 410
+    MTMINF = 420
+    NULL = 9999
+    MATERIAL_TYPE_UNK1 = 0
+    MATERIAL_TYPE_UNK2 = 1
+    NODE_TYPE_UNK1 = 2
+    NODE_TYPE_UNK2 = 3
+    NODE_TYPE_UNK3 = 4
+    NODE_TYPE_UNK4 = 460
+    NODE_TYPE_UNK5 = 320
+    NODE_TYPE_UNK6 = 420
+    REF = 20
+    SWITCH_STUFF_UNK1 = 311 # IMM3???
+    SWITCH_STUFF_UNK2 = 411 # IMMINF2???
+    
+materials_ordered = [
+    RESType.MATERIAL_TYPE_UNK1,
+    RESType.MATERIAL_1,
+    RESType.MATERIAL_2,
+    RESType.TEXTURE_DATA,
+    RESType.MATERIAL_TYPE_UNK2,
+    RESType.MATERIAL_DATA,
+]
+
+nodes_ordered = [
+    RESType.MESH_NAME,
+    RESType.BONE,
+    RESType.ANIMATION_MTN2,
+    RESType.ANIMATION_MTN3,
+    RESType.ANIMATION_IMM2,
+    RESType.ANIMATION_MTM2,
+    RESType.SHADING,
+    RESType.NODE_TYPE_UNK2,
+    RESType.PROPERTIES,
+    RESType.MTNINF,
+    RESType.MTNINF2,
+    RESType.IMMINF,
+    RESType.MTMINF,
+    RESType.TEXPROJ,
+]
+
+##########################################
+# Render library
+##########################################
+
+# A model can hold a render library like fix.xr: types of the V2 library list (written in this order), slots of the V1 XRES header
+RENDER_LIBRARY_TYPES = {
+    "shader_binaries": 100,
+    "vertex_programs": 110,
+    "combiners": 120,
+    "render_programs": 190,
+    "luts": 200,
+}
+
+RENDER_LIBRARY_SLOTS = {
+    "shader_binaries": 2,
+    "vertex_programs": 3,
+    "combiners": 4,
+    "luts": 5,
+    "render_programs": 10,
+}
+
+RENDER_LIBRARY_LENGTHS = {
+    "shader_binaries": 12,
+    "vertex_programs": 20,
+    "combiners": 8,
+    "render_programs": 16,
+    "luts": 8,
+}
+
+##########################################
+# Sampler
+##########################################
+
+WRAP_MODES = {
+    "EXTEND": 0,
+    "CLIP": 1,
+    "REPEAT": 2,
+    "MIRROR": 3,
+}
+
+FILTER_MODES = {
+    "NEAREST": 0,
+    "LINEAR": 1,
+}
+
+MIPMAP_MODES = {
+    "DISABLED": 0,
+    "ENABLED": 1,
+}
+
+# What an untouched texture writes: 03 0A (linear, no mipmap, repeat on both axes)
+DEFAULT_SAMPLER = {
+    "wrap_s": 2,
+    "wrap_t": 2,
+    "mag_filter": 1,
+    "min_filter": 1,
+    "mip_filter": 0,
+}
+
+# Texture type of the unit, everything but 2D only works on the first texture
+TEXTURE_MODES = {
+    "DISABLED": 0,
+    "TEXTURE_2D": 1,
+    "CUBE_MAP": 2,
+    "SHADOW_2D": 3,
+    "SHADOW_CUBE": 4,
+    "PROJECTION": 5,
+}
+
+TEXTURE_MODE_VALUE_TO_NAME = {v: k for k, v in TEXTURE_MODES.items()}
+
+def decode_sampler(filter_byte, wrap_byte):
+    # Wrap byte: 2 bits for x then 2 bits for y, filter byte: magnification, minification then mipmap
+    return {
+        "wrap_s": wrap_byte & 3,
+        "wrap_t": (wrap_byte >> 2) & 3,
+        "mag_filter": filter_byte & 1,
+        "min_filter": (filter_byte >> 1) & 1,
+        "mip_filter": (filter_byte >> 2) & 1,
+    }
+
+def encode_sampler(sampler):
+    filter_byte = (sampler["mag_filter"] & 1) | ((sampler["min_filter"] & 1) << 1) | ((sampler["mip_filter"] & 1) << 2)
+    wrap_byte = (sampler["wrap_s"] & 3) | ((sampler["wrap_t"] & 3) << 2)
+
+    return filter_byte, wrap_byte
+
+##########################################
+# RES
+##########################################
+
+class ResHeader:
+    def __init__(self, data):
+        strct = Struct("<HhHHHH")
+        _stringOffset, self.Unk1, _materialTableOffset, self.MaterialTableCount, _nodeOffset, self.NodeCount = \
+            strct.unpack_from(data, 0)
+        self.StringOffset = _stringOffset << 2
+        self.MaterialTableOffset = _materialTableOffset << 2
+        self.NodeOffset = _nodeOffset << 2
+
+class ResHeaderTable:
+    def __init__(self, data, offset):
+        strct = Struct("<HHHH")
+        _dataOffset, self.Count, self.Type, self.Length = \
+            strct.unpack_from(data, offset)
+        self.DataOffset = _dataOffset << 2
+
+def read_string_table(data):
+    string_table = {}
+    text = b""
+    for i in range(len(data)):
+        char = data[i].to_bytes(1, "little")
+        if char == b"\x00":
+            text = text.decode("shift-jis")
+            if text != "":
+                if text not in string_table:
+                    string_table[crc32(text.encode("shift-jis"))] = text
+                
+                splitting = [".", "_"]
+                for j in splitting:
+                    splitted = text.split(j)
+                    for k in splitted:
+                        if k not in string_table:
+                            string_table[crc32(k.encode("shift-jis"))] = k
+            text = b""
+        else:
+            text += char
+    return string_table
+
+def open_res(data):
+    data = compressor.decompress(data)
+    
+    magic = data[:4]
+    if magic == b"XRES":
+        return open_xres(data)
+    
+    items = {}
+    
+    header = ResHeader(data[8:])
+    
+    text_section = data[header.StringOffset:len(data)]
+    string_table = read_string_table(text_section)
+    
+    def read_section_table(data, tableOffset, tableCount, skipped_types=()):
+        for i in range(tableCount):
+            pos = tableOffset + i * 8
+            
+            headerTable = ResHeaderTable(data, pos)
+            pos += 8
+            
+            if headerTable.Type in skipped_types:               continue
+            if RESType(headerTable.Type) == RESType.NULL:       continue
+            if RESType(headerTable.Type) == RESType.MESH_GROUP: continue
+            if RESType(headerTable.Type) not in items:
+                items[RESType(headerTable.Type)] = {}
+            
+            for j in range(headerTable.Count):
+                pos = headerTable.DataOffset + j * headerTable.Length
+                section = data[pos:pos+headerTable.Length]
+                
+                pos = 0
+                
+                obj_hash = unpack_from("<I", section, pos)[0]
+                if obj_hash in string_table:
+                    obj_name = string_table[obj_hash]
+                else:
+                    obj_name = f"0x{obj_hash:08X}"
+                
+                if headerTable.Length == 8:
+                    items[RESType(headerTable.Type)][obj_hash] = obj_name
+                
+                elif RESType(headerTable.Type) == RESType.TEXTURE_DATA:
+                    pos = 8
+                    
+                    items[RESType(headerTable.Type)][obj_hash] = \
+                        {"name": obj_name,
+                         "sampler": decode_sampler(*unpack_from("<BB", section, pos))}
+                
+                elif RESType(headerTable.Type) == RESType.MATERIAL_DATA:
+                    pos = 16
+                    linked_textures = []
+                    texture_modes = []
+                    max_texture = (headerTable.Length - 16) // 52
+                    for k in range(max_texture):
+                        texture_hash, texture_mode = unpack_from("<IB", section, pos)
+                        pos += 4
+
+                        if texture_hash != 0:
+                            linked_textures.append(texture_hash)
+                            texture_modes.append(texture_mode)
+
+                        pos += 48
+
+                    items[RESType(headerTable.Type)][obj_hash] = {"name": obj_name, "textures": linked_textures, "texture_modes": texture_modes}
+    
+    # The render library shares the numbers of the node tables, open_render_library reads it
+    read_section_table(data, header.MaterialTableOffset, header.MaterialTableCount, RENDER_LIBRARY_TYPES.values())
+    read_section_table(data, header.NodeOffset, header.NodeCount)
+    
+    return items
+
+##########################################
+# XRES
+##########################################
+
+class XRESHeader:    
+    def __init__(self, data):
+        self.StringOffset, unk = unpack_from("<HH", data[1])
+        self.MATERIAL_TYPE_UNK1 = HeaderTable(data[5])
+        self.MATERIAL_1 =         HeaderTable(data[6])
+        self.MATERIAL_2 =         HeaderTable(data[7])
+        self.TEXTURE_DATA =       HeaderTable(data[8])
+        self.MATERIAL_TYPE_UNK2 = HeaderTable(data[9])
+        self.MATERIAL_DATA =      HeaderTable(data[11])
+        self.MESH_NAME =          HeaderTable(data[13])
+        self.BONE =               HeaderTable(data[14])
+        self.ANIMATION_MTN2 =     HeaderTable(data[15])
+        self.ANIMATION_IMM2 =     HeaderTable(data[16])
+        self.ANIMATION_MTM2 =     HeaderTable(data[17])
+        self.SHADING =            HeaderTable(data[18])
+        self.NODE_TYPE_UNK2 =     HeaderTable(data[19])
+        self.PROPERTIES =         HeaderTable(data[20])
+        self.MTNINF =             HeaderTable(data[21])
+        self.IMMINF =             HeaderTable(data[22])
+        self.MTMINF =             HeaderTable(data[23])
+        self.TEXPROJ =            HeaderTable(data[24])
+
+class HeaderTable:
+    def __init__(self, data):
+        self.DataOffset, self.Count = unpack_from("<HH", data)
+
+type_length = {
+    RESType.BONE: 8,
+    RESType.TEXPROJ: 8,
+    RESType.PROPERTIES: 8,
+    RESType.SHADING: 8,
+    RESType.MATERIAL_1: 8,
+    RESType.MATERIAL_2: 8,
+    RESType.MESH_NAME: 8,
+    RESType.TEXTURE_DATA: 32,
+    RESType.MATERIAL_DATA: 224,
+    RESType.ANIMATION_MTN2: 8,
+    RESType.ANIMATION_IMM2: 8,
+    RESType.ANIMATION_MTM2: 8,
+    RESType.MTNINF: 8,
+    RESType.IMMINF: 8,
+    RESType.MTMINF: 8,
+}
+
+def open_xres(data):
+    items = {}
+    
+    header = XRESHeader([data[i:i+4] for i in range(0, len(data), 4)])
+    
+    text_section = data[header.StringOffset:len(data)]
+    string_table = read_string_table(text_section)
+    
+    def read_type(data, headerTable, Type):
+        if Type not in items:
+            items[Type] = {}
+        
+        for i in range(headerTable.Count):
+            pos = headerTable.DataOffset + i * type_length[Type]
+            section = data[pos:pos+type_length[Type]]
+            
+            pos = 0
+            obj_hash = unpack_from("<I", section, pos)[0]
+            if obj_hash in string_table:
+                obj_name = string_table[obj_hash]
+            else:
+                obj_name = f"0x{obj_hash:08X}"
+            
+            if Type == RESType.TEXTURE_DATA:
+                pos = 8
+                items[Type][obj_hash] = \
+                    {"name": obj_name,
+                     "sampler": decode_sampler(*unpack_from("<BB", section, pos))}
+            
+            elif Type == RESType.MATERIAL_DATA:
+                pos = 16
+                linked_textures = []
+                texture_modes = []
+                max_texture = (type_length[Type] - 16) // 52
+                for k in range(max_texture):
+                    texture_hash, texture_mode = unpack_from("<IB", section, pos)
+                    pos += 4
+                    
+                    if texture_hash != 0:
+                        linked_textures.append(texture_hash)
+                        texture_modes.append(texture_mode)
+                    
+                    pos += 48
+                
+                items[Type][obj_hash] = {"name": obj_name, "textures": linked_textures, "texture_modes": texture_modes}
+            
+            else:
+                items[Type][obj_hash] = obj_name
+    
+    read_type(data, header.BONE,           RESType.BONE)
+    read_type(data, header.TEXPROJ,        RESType.TEXPROJ)
+    read_type(data, header.PROPERTIES,     RESType.PROPERTIES)
+    read_type(data, header.SHADING,        RESType.SHADING)
+    read_type(data, header.MATERIAL_1,     RESType.MATERIAL_1)
+    read_type(data, header.MATERIAL_2,     RESType.MATERIAL_2)
+    read_type(data, header.MESH_NAME,      RESType.MESH_NAME)
+    read_type(data, header.TEXTURE_DATA,   RESType.TEXTURE_DATA)
+    read_type(data, header.MATERIAL_DATA,  RESType.MATERIAL_DATA)
+    read_type(data, header.ANIMATION_MTN2, RESType.ANIMATION_MTN2)
+    read_type(data, header.ANIMATION_IMM2, RESType.ANIMATION_IMM2)
+    read_type(data, header.ANIMATION_MTM2, RESType.ANIMATION_MTM2)
+    read_type(data, header.MTNINF,         RESType.MTNINF)
+    read_type(data, header.IMMINF,         RESType.IMMINF)
+    read_type(data, header.MTMINF,         RESType.MTMINF)
+
+    return items
+
+##########################################
+# Render library Function
+##########################################
+
+def new_render_library():
+    render_library = {}
+
+    for kind in RENDER_LIBRARY_TYPES:
+        render_library[kind] = []
+
+    return render_library
+
+def get_hash_name(obj_hash, string_table):
+    if obj_hash in string_table:
+        return string_table[obj_hash]
+
+    return f"0x{obj_hash:08X}"
+
+def get_name_hash(name):
+    # A name the archive didn't keep is written back as its hash
+    if name.startswith("0x") and len(name) == 10:
+        return int(name, 16)
+
+    return crc32(name.encode("shift-jis"))
+
+def read_render_entry(kind, entry, string_table):
+    obj_hash = unpack_from("<I", entry, 0)[0]
+
+    # The shader binaries have no name
+    name = ""
+    if obj_hash != 0:
+        name = get_hash_name(obj_hash, string_table)
+
+    item = {
+        "name": name,
+        "data": entry[8:],
+    }
+
+    if kind == "render_programs":
+        vertex_program_hash, combiner_hash = unpack_from("<II", entry, 8)
+        item["vertex_program"] = get_hash_name(vertex_program_hash, string_table)
+        item["combiner"] = get_hash_name(combiner_hash, string_table)
+
+    return item
+
+def open_render_library(data):
+    data = compressor.decompress(data)
+    render_library = new_render_library()
+
+    if data[:4] == b"XRES":
+        string_table = read_string_table(data[unpack_from("<H", data, 4)[0]:])
+
+        for kind, slot in RENDER_LIBRARY_SLOTS.items():
+            offset, count = unpack_from("<HH", data, slot * 4)
+            length = RENDER_LIBRARY_LENGTHS[kind]
+
+            for i in range(count):
+                pos = offset + i * length
+                render_library[kind].append(read_render_entry(kind, data[pos:pos+length], string_table))
+
+        return render_library
+
+    header = ResHeader(data[8:])
+    string_table = read_string_table(data[header.StringOffset:])
+
+    for i in range(header.MaterialTableCount):
+        header_table = ResHeaderTable(data, header.MaterialTableOffset + i * 8)
+
+        for kind, res_type in RENDER_LIBRARY_TYPES.items():
+            if header_table.Type == res_type:
+                for j in range(header_table.Count):
+                    pos = header_table.DataOffset + j * header_table.Length
+                    render_library[kind].append(read_render_entry(kind, data[pos:pos+header_table.Length], string_table))
+
+    return render_library
+
+def add_library_string(name, string_table, string_offsets):
+    if name not in string_offsets:
+        string_offsets[name] = len(string_table)
+        string_table += name.encode("shift-jis") + int(0).to_bytes(1, 'little')
+
+    return string_offsets[name], string_table
+
+def make_render_library(render_library, string_table):
+    """The RES entries of a render library, the names are added to the string table."""
+    sections = {}
+    string_offsets = {}
+
+    if render_library is None:
+        return sections, string_table
+
+    for kind, items in render_library.items():
+        entries = []
+
+        for item in items:
+            entry = bytes()
+
+            if item["name"] == "":
+                entry += bytes(8)
+            else:
+                entry += get_name_hash(item["name"]).to_bytes(4, 'little')
+
+                if item["name"].startswith("0x"):
+                    entry += bytes(4)
+                else:
+                    string_offset, string_table = add_library_string(item["name"], string_table, string_offsets)
+                    entry += int(string_offset).to_bytes(4, 'little')
+
+            if kind == "render_programs":
+                entry += get_name_hash(item["vertex_program"]).to_bytes(4, 'little')
+                entry += get_name_hash(item["combiner"]).to_bytes(4, 'little')
+
+                # The names of fix.xr are kept so that a new import shows them
+                for name in (item["vertex_program"], item["combiner"]):
+                    if not name.startswith("0x"):
+                        string_offset, string_table = add_library_string(name, string_table, string_offsets)
+            else:
+                entry += item["data"]
+
+            entries.append(entry.ljust(RENDER_LIBRARY_LENGTHS[kind], b'\x00'))
+
+        if entries:
+            sections[kind] = entries
+
+    return sections, string_table
+
+def get_animation_types(animations):
+    animation_types = []
+
+    for animation in animations:
+        for animation_type, animation_data in animation['types'].items():
+            animation_types.append((animation_type, animation_data))
+
+    return animation_types
+
+def make_library(meshes = [], armature = None, textures = {}, animations = [], outlines = [], properties=[], texprojs=[]):
+    items = {}
+    string_table = bytes()
+    materials_offset = {}
+    
+    if meshes:
+        # Add material name (twice time no idea why)
+        materials_name = []
+        
+        for mesh in meshes:
+            material_name = mesh.material_name.encode("shift-jis")
+            materials_name.append(crc32(material_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little')) 
+            materials_offset[material_name] = len(string_table)           
+            string_table += material_name + int(0).to_bytes(1, 'little')
+        
+        items[RESType.MATERIAL_1] = materials_name
+        items[RESType.MATERIAL_2] = materials_name
+        
+        # Add mesh name
+        meshes_name = []
+        
+        for mesh in meshes:
+            mesh_name = mesh.name.encode("shift-jis")
+            meshes_name.append(crc32(mesh_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little'))   
+            string_table += mesh_name + int(0).to_bytes(1, 'little')
+                
+        items[RESType.MESH_NAME] = meshes_name
+
+    if textures:
+        # Add texture data (texture name and texture mode)
+        textures_data = [] 
+        
+        for texture_name, texture_data in textures.items():
+            texture_name_encoded = texture_name.encode("shift-jis")
+            filter_byte, wrap_byte = encode_sampler(texture_data.get('sampler', DEFAULT_SAMPLER))
+            textures_data.append(crc32(texture_name_encoded).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little') + pack("<BB", filter_byte, wrap_byte) + bytes(10))
+            string_table += texture_name_encoded + int(0).to_bytes(1, 'little')
+            
+        items[RESType.TEXTURE_DATA] = textures_data
+
+        # Add material data (texture used by the material)
+        materials_info = {}
+        
+        # linked_material holds (material name, slot index, texture mode): a texture can fill several slots of one material
+        for texture_name, texture_data in textures.items():
+            for material_name, slot_index, texture_mode in texture_data['linked_material']:
+                if material_name not in materials_info:
+                    materials_info[material_name] = {}
+
+                materials_info[material_name][slot_index] = (texture_name, texture_mode)
+
+        materials_data = []
+        for material_name, material_slots in materials_info.items():
+            material_info = []
+            for slot_index in sorted(material_slots):
+                material_info.append(material_slots[slot_index])
+
+            material_name_encoded = material_name.encode("shift-jis")
+            material_name_crc32 = crc32(material_name_encoded).to_bytes(4, 'little')
+            
+            if material_name in materials_offset:
+                material_data = material_name_crc32 + int(materials_offset[material_name]).to_bytes(4, 'little') + material_name_crc32 + material_name_crc32
+            else:
+                material_data = material_name_crc32 + int(0).to_bytes(4, 'little') + material_name_crc32 + material_name_crc32
+            
+            for i in range(4):
+                if i < len(material_info):
+                    texture_name, texture_mode = material_info[i]
+                    material_data += crc32(texture_name.encode("shift-jis")).to_bytes(4, 'little') + int(texture_mode).to_bytes(4, 'little')
+                    material_data += bytes.fromhex("0000803F0000803F00000000000000000000803F00000000000000000000803F00000000000000000000803F")
+                else:
+                    material_data += bytes.fromhex("00000000000000000000803F0000803F00000000000000000000803F00000000000000000000803F00000000000000000000803F")
+                    
+            materials_data.append(material_data)
+        
+        items[RESType.MATERIAL_DATA] = materials_data
+        
+    if armature:
+        bones_name = []
+        
+        for bone in armature.pose.bones:
+            bone_name = bone.name.encode("shift-jis")
+            bones_name.append(crc32(bone_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little'))
+            string_table += bone_name + int(0).to_bytes(1, 'little')
+
+        items[RESType.BONE] = bones_name
+        
+    if animations:
+        # Add animation name
+        animations_mtn2 = []
+        animations_imm2 = []
+        animations_mtm2 = []
+        animations_offset = {}
+        
+        for animation_type, animation_data in get_animation_types(animations):
+            animation_name = animation_data['name']
+            animation_name_encoded = animation_name.encode("shift-jis")
+            
+            if animation_name not in animations_offset:
+                animations_offset[animation_name] = len(string_table)
+                string_table += animation_name_encoded + int(0).to_bytes(1, 'little')
+            
+            animation_bytes = crc32(animation_name_encoded).to_bytes(4, 'little') + int(animations_offset[animation_name]).to_bytes(4, 'little')
+
+            if animation_type == 'armature':
+               animations_mtn2.append(animation_bytes) 
+            elif animation_type == 'uv':
+                animations_imm2.append(animation_bytes) 
+            elif animation_type == 'material':
+                animations_mtm2.append(animation_bytes) 
+        
+        items[RESType.ANIMATION_MTN2] = animations_mtn2
+        items[RESType.ANIMATION_IMM2] = animations_imm2
+        items[RESType.ANIMATION_MTM2] = animations_mtm2        
+
+        # Add animation split name
+        mtninfs = []
+        immninfs = []
+        mtminfs = []
+        animations_split_offset = {}
+        
+        for animation_type, animation_data in get_animation_types(animations):
+            for split_animation in animation_data['split_animation']['split']:
+                animation_split_name = split_animation.name
+                animation_split_name_encoded = animation_split_name.encode("shift-jis")
+                
+                if animation_split_name not in animations_split_offset:
+                    animations_split_offset[animation_split_name] = len(string_table)
+                    string_table += animation_split_name_encoded + int(0).to_bytes(1, 'little')
+                
+                animation_split_bytes = crc32(animation_split_name_encoded).to_bytes(4, 'little') + int(animations_split_offset[animation_split_name]).to_bytes(4, 'little')
+
+                if animation_type == 'armature':
+                   mtninfs.append(animation_split_bytes) 
+                elif animation_type == 'uv':
+                    immninfs.append(animation_split_bytes) 
+                elif animation_type == 'material':
+                    mtminfs.append(animation_split_bytes) 
+                
+        items[RESType.MTNINF] = mtninfs
+        items[RESType.IMMINF] = immninfs
+        items[RESType.MTMINF] = mtminfs          
+
+    if outlines:
+        outlines_name = []
+        
+        for outline in outlines:
+            outline_name = outline['name'].encode("shift-jis")
+            outlines_name.append(crc32(outline_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little'))
+            string_table += outline_name + int(0).to_bytes(1, 'little')
+            
+        items[RESType.SHADING] = outlines_name
+        
+    if properties:
+        properties_name = []
+        
+        for archive_property in properties:
+            property_name = archive_property[0].encode("shift-jis")
+            properties_name.append(crc32(property_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little'))
+            string_table += property_name + int(0).to_bytes(1, 'little')
+            
+        items[RESType.PROPERTIES] = properties_name
+        
+    if texprojs:
+        texprojs_name = []
+        
+        for texproj in texprojs:
+            texproj_name = texproj[0].encode("shift-jis")
+            texprojs_name.append(crc32(texproj_name).to_bytes(4, 'little') + int(len(string_table)).to_bytes(4, 'little'))
+            string_table += texproj_name + int(0).to_bytes(1, 'little')
+            
+        items[RESType.TEXPROJ] = texprojs_name
+        
+    return items, string_table
+                
+def write_res(magic, items, string_table, render_sections=None):
+    # The game walks the library list by increasing type, the render library comes before the materials
+    materials = {}
+    if render_sections:
+        for kind, res_type in RENDER_LIBRARY_TYPES.items():
+            if kind in render_sections:
+                materials[res_type] = render_sections[kind]
+
+    for key, value in items.items():
+        if key in materials_ordered:
+            materials[key.value] = value
+
+    nodes = {key: value for key, value in items.items() if key in nodes_ordered}
+
+    header = {
+        'Magic': int.from_bytes(magic, byteorder='little'),
+        '_stringOffset': 0,  # Placeholder for string offset
+        'Unk1': 1,
+        '_materialTableOffset': 0,  # Placeholder for material table offset
+        'MaterialTableCount': len(materials),
+        '_nodeOffset': 0,  # Placeholder for node offset
+        'NodeCount': len(nodes),
+    }
+
+    table_count = len(materials) + len(nodes)
+    header_pos = 20
+    data_pos = header_pos + table_count * 8
+
+    with io.BytesIO() as writer_res:
+        with io.BytesIO() as writer_table:
+            with io.BytesIO() as writer_data:
+                # Material - Header table
+                if materials:
+                    header['_materialTableOffset'] = header_pos >> 2
+
+                    for res_type, res_value in materials.items():
+                        res_value_length = 0
+
+                        if len(res_value) > 0:
+                            res_value_length = len(res_value[0])
+
+                        material_header_table = {
+                            '_dataOffset': data_pos >> 2,
+                            'Count': len(res_value),
+                            'Type': res_type,
+                            'Length': res_value_length,
+                        }
+
+                        header_pos += 8
+                        data_pos += sum(len(byte_array) for byte_array in res_value)
+
+                        writer_table.write(pack('<hhhh', *material_header_table.values()))
+                        writer_data.write(b''.join(res_value))
+
+                # Node - Header table
+                if nodes:
+                    header['_nodeOffset'] = header_pos >> 2
+
+                    for res_type, res_value in nodes.items():
+                        res_value_length = 0
+                        
+                        if len(res_value) > 0:
+                            res_value_length = len(res_value[0])
+                        
+                        node_header_table = {
+                            '_dataOffset': data_pos >> 2,
+                            'Count': len(res_value),
+                            'Type': res_type.value,
+                            'Length': res_value_length,
+                        }
+
+                        header_pos += 8
+                        data_pos += sum(len(byte_array) for byte_array in res_value)
+
+                        writer_table.write(pack('<hhhh', *node_header_table.values()))
+                        writer_data.write(b''.join(res_value))
+
+                # String table
+                header['_stringOffset'] = writer_data.tell() + 20 + table_count * 8 >> 2
+                writer_data.write(string_table)
+                        
+                # Calculate padding for alignment
+                remaining_bytes = 4 - (writer_res.tell() % 4)
+                if remaining_bytes != 4:
+                    padding = bytes([0] * remaining_bytes)
+                    writer_res.write(padding)                        
+
+                writer_res.seek(0)
+                print(header)
+                writer_res.write(pack('<qhhhhhh', *header.values()))
+                writer_res.write(writer_table.getvalue())
+                writer_res.write(writer_data.getvalue())
+                
+                return compressor.compress(writer_res.getvalue())
+
+type_order = [
+    RESType.MATERIAL_TYPE_UNK1,
+    RESType.MATERIAL_1,
+    RESType.MATERIAL_2,
+    RESType.TEXTURE_DATA,
+    RESType.MATERIAL_TYPE_UNK2,
+    RESType.MATERIAL_DATA,
+    RESType.MESH_NAME,
+    RESType.BONE,
+    RESType.ANIMATION_MTN2,
+    RESType.ANIMATION_IMM2,
+    RESType.ANIMATION_MTM2,
+    RESType.SHADING,
+    RESType.NODE_TYPE_UNK1,
+    RESType.PROPERTIES,
+    RESType.MTNINF,
+    RESType.IMMINF,
+    RESType.MTMINF,
+    RESType.TEXPROJ,
+]
+
+data_order = [
+    RESType.TEXTURE_DATA,
+    RESType.MATERIAL_1,
+    RESType.MATERIAL_2,
+    RESType.MATERIAL_TYPE_UNK1,
+    RESType.MATERIAL_TYPE_UNK2,
+    RESType.MATERIAL_DATA,
+    RESType.MESH_NAME,
+    RESType.BONE,
+    RESType.ANIMATION_MTN2,
+    RESType.ANIMATION_IMM2,
+    RESType.ANIMATION_MTM2,
+    RESType.SHADING,
+    RESType.NODE_TYPE_UNK1,
+    RESType.PROPERTIES,
+    RESType.MTNINF,
+    RESType.IMMINF,
+    RESType.MTMINF,
+    RESType.TEXPROJ,
+]
+
+def write_xres(magic, items, string_table, render_sections=None):
+    data = bytes()
+
+    if render_sections is None:
+        render_sections = {}
+
+    for res_type in type_order:
+        if res_type in items:
+            for i in range(len(items[res_type])):
+                if type_length[res_type] != len(items[res_type][i]):
+                    resized_array = items[res_type][i].ljust(type_length[res_type], b'\x00')
+                    items[res_type][i] = resized_array
+
+    items_length = sum(len(item) for sublist in items.values() for item in sublist)
+    render_length = sum(len(entry) for entries in render_sections.values() for entry in entries)
+    string_offset = 0x64 + items_length + render_length
+
+    # The render library is written after the tables, in slots of the header the models leave empty
+    render_slots = {}
+    render_offset = 0x64 + items_length
+    for kind, entries in render_sections.items():
+        render_slots[RENDER_LIBRARY_SLOTS[kind]] = pack("<HH", render_offset, len(entries))
+        render_offset += sum(len(entry) for entry in entries)
+
+    data += magic
+    data += pack("<H", string_offset)
+    data += pack("<H", 0x01)
+
+    for slot in (2, 3, 4):
+        data += render_slots.get(slot, bytes(4))
+
+    data_offset = 0x64
+    for res_type in type_order:
+        if res_type == RESType.MATERIAL_TYPE_UNK1 and 5 in render_slots:
+            data += render_slots[5]
+        elif res_type in items:
+            data += pack("<H", data_offset)
+            data += pack("<H", len(items[res_type]))
+            data_offset += sum(len(item) for item in items[res_type])
+        else:
+            data += pack("<HH", 0x64, 0)
+
+        if res_type == RESType.MATERIAL_TYPE_UNK2:
+            data += render_slots.get(10, bytes(4))
+        elif res_type == RESType.MATERIAL_DATA:
+            data += pack("<I", 0x00)
+
+    for res_type in type_order:
+        if res_type in items:
+            for item in items[res_type]:
+                data += item
+
+    for entries in render_sections.values():
+        for entry in entries:
+            data += entry
+
+    data += string_table
+    
+    while len(data) % 4 != 0:
+        data += b"\x00"
+    
+    return compressor.compress(data)

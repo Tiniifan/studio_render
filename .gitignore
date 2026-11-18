@@ -1,0 +1,27 @@
+# Local script that refreshes studio_eleven/ from the Blender addon, never committed
+sync_studio_eleven.bat
+
+# Game data unpacked at run time from studio_eleven/rendering/games/*.zip; studio_render does not use the default
+# games of studio_eleven (default_v1, default_v2), they are not versioned either
+studio_eleven/rendering/games/*/
+studio_eleven/rendering/games/installed.json
+
+__pycache__/
+*.pyc
+.venv/
+screenshots/
+
+# Preferences of the user, written by the application
+studio_render.ini
+studio_render.log
+
+# Official template projects and what builds them (the tool and the specs, with their source paths): kept local
+official_projects/
+tools/build_template.py
+tools/templates/
+
+# Builds of build_exe.bat: out/<version>/studio_render/ and studio_render.zip
+out/
+
+# Local documents
+docs/

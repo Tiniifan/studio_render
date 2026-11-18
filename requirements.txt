@@ -1,0 +1,6 @@
+numpy>=1.24
+moderngl>=5.8
+PySide6>=6.5
+Pillow>=9.0
+imageio>=2.31
+imageio-ffmpeg>=0.5

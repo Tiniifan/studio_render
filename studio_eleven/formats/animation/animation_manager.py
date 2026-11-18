@@ -1,0 +1,814 @@
+import bisect
+import warnings
+from struct import pack, unpack, unpack_from, calcsize, Struct
+from io import BytesIO
+from enum import Enum
+from zlib import crc32
+from ...compression import *
+from .tracks import *
+from . import animation_support
+
+def ReadString(byte_io):
+    bytes_list = []
+    
+    while True:
+        byte = byte_io.read(1)
+        if byte == b'\x00':
+            break
+        bytes_list.append(byte)
+        
+    name = b''.join(bytes_list).decode('shift-jis')
+    return name
+
+class Frame:
+    def __init__(self, key: int, value: object=None):
+        self.Key = key
+        self.Value = value if value else object
+
+class Node:
+    def __init__(self, name: int, interpolation: int=animation_support.INTERPOLATION_LINEAR, Frames: list[Frame]=None):
+        self.Name = name
+        self.Interpolation = interpolation
+        self.Frames = Frames if Frames else []
+        # V1 files only: the frame -> key table as stored (the game reads it), its length (node +0x14, also the loop
+        # length of the game) and what is wrong with the keys or the table (empty for a well formed node)
+        self.FrameTable = None
+        self.TableLength = None
+        self.KeyIssues = []
+
+    def frame_exists(self, frame_key):
+        for frame in self.Frames:
+            if frame.Key == frame_key:
+                return True
+
+        return False
+
+    def add_frame(self, frame_key, value):
+        if self.frame_exists(frame_key) == False:
+            # Keep the keys sorted by frame whatever the call order
+            position = bisect.bisect_right([frame.Key for frame in self.Frames], frame_key)
+            self.Frames.insert(position, Frame(frame_key, value))
+
+
+def sort_frames(node):
+    """Sort the keys of a node by frame (in place), drop exact duplicates, refuse two different values on one frame.
+
+    The V1 frame -> key table and the game's interpolation (next key = next data entry) need increasing keys.
+    """
+    frames = sorted(node.Frames, key=lambda frame: frame.Key)
+    result = []
+    for frame in frames:
+        if result and result[-1].Key == frame.Key:
+            previous = result[-1].Value
+            if previous is frame.Value or previous == frame.Value:
+                continue
+            name = node.Name if isinstance(node.Name, str) else hex(node.Name)
+            raise ValueError(f"Node {name}: two different values on frame {frame.Key}")
+        result.append(frame)
+    node.Frames[:] = result
+
+
+def expected_frame_table(keys, size):
+    """For each frame, the index of the key with the greatest frame <= it (0 before the first key)."""
+    order = sorted(range(len(keys)), key=lambda index: keys[index])
+    table = [0] * size
+    position = -1
+    for frame in range(size):
+        while position + 1 < len(order) and keys[order[position + 1]] <= frame:
+            position += 1
+        if position >= 0:
+            table[frame] = order[position]
+    return table
+
+
+def frame_table_issues(keys, table, frame_count):
+    """What makes a V1 node read differently by the game than its keys say (empty list if nothing)."""
+    issues = []
+    breaks = [i for i in range(1, len(keys)) if keys[i] <= keys[i - 1]]
+    if breaks:
+        i = breaks[0]
+        issues.append(f"keys not increasing at {len(breaks)} place(s), first at index {i}: frame {keys[i - 1]} then {keys[i]}")
+    if len(table) != frame_count + 1:
+        issues.append(f"frame table has {len(table)} entries for {frame_count + 1} frames")
+    out_of_range = [frame for frame, index in enumerate(table) if index >= len(keys)]
+    if out_of_range:
+        issues.append(f"frame table points past the {len(keys)} keys at {len(out_of_range)} frame(s), first frame {out_of_range[0]}")
+    expected = expected_frame_table(keys, len(table))
+    wrong = [frame for frame in range(len(table)) if table[frame] != expected[frame] and table[frame] < len(keys)]
+    if wrong:
+        frame = wrong[0]
+        issues.append(f"frame table points to the wrong key at {len(wrong)} frame(s), first frame {frame}: "
+                      f"key {table[frame]} (frame {keys[table[frame]]}) instead of key {expected[frame]} (frame {keys[expected[frame]]})")
+    return issues
+
+class Track:
+    def __init__(self, name: str, index: int=None, nodes: list[Node]=None):
+        self.Name = name
+        self.Index = index if index is not None else -1
+        self.Nodes = nodes if nodes else []
+    
+    def GetNodeByName(self, name: int):
+        for nodeEntry in self.Nodes:
+            if nodeEntry.Name == name:
+                return nodeEntry
+        return None
+    
+    def NodeExists(self, name: int) -> bool:
+        for nodeEntry in self.Nodes:
+            if nodeEntry.Name == name:
+                return True
+        return False
+
+class AnimationManager:
+    def __init__(self, Format=None, Version=None, AnimationName=None, FrameCount=None, Tracks=None,
+            reader=None):
+        self.Format = Format
+        self.Version = Version
+        self.AnimationName = AnimationName
+        self.FrameCount = FrameCount
+        self.Tracks: list[Track] = Tracks if Tracks else []
+        # (track name, node hash, issue) of the V1 nodes the game reads differently than their keys say
+        self.KeyIssues = []
+        if reader:
+            self.Read(reader)
+    
+    def Read(self, reader):
+        # Read header
+        header = animation_support.Header.Unpack(reader)
+        
+        # Get format name
+        self.Format = header.Magic.decode()
+        
+        # Wrong header? Try the second pattern
+        if header.DecompSize == 0:
+            reader.seek(0)
+            header2 = animation_support.Header2.Unpack(reader)
+            header.DecompSize = header2.DecompSize
+            header.NameOffset = header2.NameOffset
+            header.CompDataOffset = header2.CompDataOffset
+            header.Track1Count = header2.Track1Count
+            header.Track2Count = header2.Track2Count
+            
+            # Track3 and Track4 doesn't exist in this header
+            header.Track3Count = -1
+            header.Track4Count = -1
+            
+        # Track 9 case
+        maxNodeBeforeTrack4 = 0
+        if header.NameOffset == 0x28 and header.CompDataOffset == 0x58:
+            reader.seek(0x24)
+            maxNodeBeforeTrack4 = unpack("<I", reader.read(4))[0]
+            
+        # Get animation name
+        reader.seek(header.NameOffset)
+        animHash = unpack("<I", reader.read(4))[0]
+        self.AnimationName = ReadString(reader)
+        
+        # Get frame count
+        reader.seek(header.CompDataOffset - 4)
+        self.FrameCount = unpack("<I", reader.read(4))[0]
+        
+        # Get decomp block
+        reader = BytesIO(compressor.decompress(reader.read()))
+        
+        hashOffset = unpack("<I", reader.read(4))[0]
+        trackoffset = unpack("<I", reader.read(4))[0]
+        
+        reader.seek(0)
+        if hashOffset == 0x0c:
+            self.Version = "V2"
+            self.GetAnimationDataV2(reader, header, maxNodeBeforeTrack4)
+        else:
+            self.Version = "V1"
+            self.GetAnimationDataV1(reader, header)
+
+            if self.KeyIssues:
+                track_name, node_name, issue = self.KeyIssues[0]
+                warnings.warn(f"{self.AnimationName}: {len(self.KeyIssues)} V1 node issue(s) the game reads differently, "
+                              f"first {track_name} {node_name:#010x}: {issue}", stacklevel=2)
+    
+    def CountInTrack(self, searchIndex):
+        if any(track.Index == searchIndex for track in self.Tracks):
+            return len(next(track for track in self.Tracks if track.Index == searchIndex).Nodes)
+        elif len(self.Tracks) > searchIndex and self.Tracks[searchIndex].Index == -1:
+            return len(self.Tracks[searchIndex].Nodes)
+        else:
+            return 0
+    
+    def Save(self):
+        # XMTN V2 stores the bone count at 0x24, the name and the compressed data are 4 bytes further
+        has_bone_count = self.Format == "XMTN" and self.Version != "V1"
+
+        name_offset = 0x24
+        data_offset = 0x54
+        if has_bone_count:
+            name_offset = 0x28
+            data_offset = 0x58
+
+        with BytesIO() as writer:
+            header = animation_support.Header(
+                str(self.Format).encode(),
+                0x00,
+                name_offset,
+                data_offset,
+                0,
+                0,
+                0,
+                0
+            )
+            
+            header.Track1Count = self.CountInTrack(0)
+            header.Track2Count = self.CountInTrack(1)
+            header.Track3Count = self.CountInTrack(2)
+            header.Track4Count = self.CountInTrack(3)
+            
+            # Don't exceed 40 characters
+            if len(self.AnimationName) > 40:
+                self.AnimationName = self.AnimationName[:40]
+                
+            # Write bone count
+            writer.seek(0x24)
+            if has_bone_count:
+                # Names of the location, rotation and scale nodes, the BoneBool names follow them
+                writer.write(pack("<I", len(self.GetNameHashes())))
+  
+            # Write animation hash
+            writer.write(pack("<I", (crc32(self.AnimationName.encode("shift-jis")))))
+            writer.write(self.AnimationName.encode("shift-jis"))
+            
+            frame_offset = 0x50
+            if has_bone_count:
+                frame_offset = 0x54
+            
+            # Get the current position
+            current_position = writer.tell()  
+            num_bytes_to_write = frame_offset - current_position
+    
+            # Write the calculated number of zeros
+            if num_bytes_to_write > 0:
+                writer.write(bytes(num_bytes_to_write))
+            
+            writer.write(self.FrameCount.to_bytes(4, 'little'))
+            
+            # Write animation data
+            if self.Version == "V1":
+                self.SaveAnimationDataV1(writer, header)
+            else:
+                self.SaveAnimationDataV2(writer, header)
+                
+            writer.seek(0x00)
+            if self.Format == "XMTM":
+                header2 = animation_support.Header2(
+                    str(self.Format).encode("shift-jis"),
+                    0x00,
+                    header.DecompSize,
+                    0x24,
+                    0x54,
+                    header.Track1Count,
+                    header.Track2Count,
+                )
+                writer.write(header2.Pack())
+            elif self.Format == "XIMA":
+                xima_header = animation_support.XIMAHeader(
+                    str(self.Format).encode("shift-jis"),
+                    header.DecompSize,
+                    0x24,
+                    0x54,
+                    header.Track1Count,
+                    header.Track2Count,
+                    header.Track3Count,
+                    header.Track4Count,
+                )
+                writer.write(xima_header.Pack())                
+            else:
+                writer.write(header.Pack())
+            
+            return writer.getvalue()
+    
+    def GetAnimationDataV1(self, reader, header):
+        trackIndex = 0
+        tableOffset = 0
+        
+        if header.Track1Count > 0:
+            for i in range(header.Track1Count):
+                tableOffset = self.ReadFrameDataV1(reader, tableOffset, 0, trackIndex)
+            trackIndex += 1
+            
+        if header.Track2Count > 0:
+            for i in range(header.Track2Count):
+                tableOffset = self.ReadFrameDataV1(reader, tableOffset, 1, trackIndex)
+            trackIndex += 1
+            
+        if header.Track3Count > 0:
+            for i in range(header.Track3Count):
+                tableOffset = self.ReadFrameDataV1(reader, tableOffset, 2, trackIndex)
+            trackIndex += 1
+            
+        if header.Track4Count > 0:
+            for i in range(header.Track4Count):
+                tableOffset = self.ReadFrameDataV1(reader, tableOffset, 3, trackIndex)
+            trackIndex += 1
+    
+    def GetAnimationDataV2(self, reader, header, maxNodeBeforeTrack4):
+        dataHeader = animation_support.DataHeader.Unpack(reader)
+        
+        # Get name hashes
+        reader.seek(dataHeader.HashOffset)
+        elementCount = (dataHeader.TrackOffset - dataHeader.HashOffset) // 4
+        nameHashes = [unpack("<I", reader.read(4))[0] for i in range(elementCount)]
+        
+        # Name information
+        pos = 0
+        nameDict = {
+            0: nameHashes,
+            1: nameHashes,
+            2: nameHashes,
+            3: nameHashes,
+        }
+        
+        # Track information
+        trackCountList = [
+            header.Track1Count,
+            header.Track2Count,
+            header.Track3Count,
+            header.Track4Count,
+        ]
+        
+        trackCount = (1 if header.Track1Count != -1 else 0) + \
+                     (1 if header.Track2Count != -1 else 0) + \
+                     (1 if header.Track3Count != -1 else 0) + \
+                     (1 if header.Track4Count != -1 else 0)
+                     
+        tracks = []
+        for i in range(trackCount):
+            reader.seek(dataHeader.TrackOffset + 2 * i)
+            reader.seek(unpack("<H", reader.read(2))[0])
+            tracks.append(animation_support.Track.Unpack(reader))
+            
+            if tracks[i].Type != 0:
+                self.Tracks.append(Track(animation_support.TrackType[tracks[i].Type], index=i))
+                
+                if i < 3 and trackCountList[i + 1] == 0 and i+1 != 3:
+                    if maxNodeBeforeTrack4 < 1:
+                        pos += trackCountList[i] * 4
+                        
+                        for j in range(i + 1, trackCount):
+                            nameDict[j] = None
+                elif tracks[i].Type == 9 and maxNodeBeforeTrack4 > 0:
+                    nameDict[i] = None
+                    pos += maxNodeBeforeTrack4 * 4
+                    
+            if nameDict[i] is None:
+                reader.seek(dataHeader.HashOffset + pos)
+                nameDict[i] = [unpack("<I", reader.read(4))[0] for j in range(trackCountList[i])]
+                
+        offset = 0
+        index = 0
+        trackIndex = 0
+        
+        if header.Track1Count > 0:
+            self.ReadFrameDataV2(reader, offset, header.Track1Count, dataHeader.DataOffset, nameDict[0], tracks[0], trackIndex)
+            trackIndex += 1
+        offset += header.Track1Count
+        index += 1
+        
+        if header.Track2Count > 0:
+            self.ReadFrameDataV2(reader, offset, header.Track2Count, dataHeader.DataOffset, nameDict[1], tracks[1], trackIndex)
+            trackIndex += 1
+        offset += header.Track2Count
+        index += 1
+        
+        if header.Track3Count > 0:
+            self.ReadFrameDataV2(reader, offset, header.Track3Count, dataHeader.DataOffset, nameDict[2], tracks[2], trackIndex)
+            trackIndex += 1
+        offset += header.Track3Count
+        index += 1
+        
+        if header.Track4Count > 0:
+            self.ReadFrameDataV2(reader, offset, header.Track4Count, dataHeader.DataOffset, nameDict[3], tracks[3], trackIndex)
+    
+    def GetGroupsV1(self):
+        """Nodes of each V1 group, a node without interpolation is held in group 3 or written as steps."""
+        groups = [[], [], [], []]
+
+        for track in self.Tracks:
+            for node in track.Nodes:
+                group = animation_support.TrackGroupV1[track.Name]
+
+                if node.Interpolation == animation_support.INTERPOLATION_CONSTANT:
+                    if track.Name in animation_support.TrackHoldGroupV1:
+                        group = animation_support.TrackHoldGroupV1[track.Name]
+                    else:
+                        # V1 only holds the keys of group 3, the other nodes jump from a key to the next one in one frame
+                        node = Node(node.Name, animation_support.INTERPOLATION_LINEAR, self.GetStepFrames(node.Frames))
+
+                groups[group].append((track.Name, node))
+
+        return groups
+
+    def GetStepFrames(self, frames):
+        step_frames = []
+
+        for i, frame in enumerate(frames):
+            if i > 0 and frame.Key - frames[i - 1].Key > 1:
+                step_frames.append(Frame(frame.Key - 1, frames[i - 1].Value))
+
+            step_frames.append(frame)
+
+        return step_frames
+
+    def SaveAnimationDataV1(self, writerDecomp, header):
+        if self.Tracks == None or len(self.Tracks) == 0:
+            return
+
+        for track in self.Tracks:
+            for node in track.Nodes:
+                sort_frames(node)
+
+        groups = self.GetGroupsV1()
+
+        header.Track1Count = len(groups[0])
+        header.Track2Count = len(groups[1])
+        header.Track3Count = len(groups[2])
+        header.Track4Count = len(groups[3])
+
+        with BytesIO() as writer:
+            hashCount = self.CountHashes()
+            headerPos = 0
+            nodeOffset = hashCount * 20
+
+            for group in groups:
+                for trackName, node in group:
+                    # After the last key the game interpolates toward the first key, a key on the last frame stops it
+                    if node.Interpolation != animation_support.INTERPOLATION_CONSTANT:
+                        self.FixNode([node], self.FrameCount)
+
+                    nameInt = node.Name
+                    if isinstance(node.Name, str):
+                        nameInt = int(node.Name, 16)
+
+                    dataVectorSize = animation_support.TrackDataCount[trackName]
+                    dataByteSize = animation_support.TrackDataSizeV1[trackName]
+                    nodeHeader = animation_support.Node(
+                        nameInt,
+                        next((key for key, value in animation_support.TrackType.items() if value == trackName), None),
+                        animation_support.TrackDataTypeV1[trackName],
+                        node.Interpolation,
+                        0,
+                        0,
+                        self.FrameCount,
+                        len(node.Frames),
+                        self.FrameCount + 1,
+                        dataByteSize,
+                        dataVectorSize,
+                        dataVectorSize * dataByteSize,
+                        (self.FrameCount + 1) * 2,
+                        len(node.Frames) * 2,
+                        len(node.Frames) * dataVectorSize * dataByteSize
+                    )
+
+                    # Write node table
+                    writer.seek(nodeOffset)
+                    writer.write(nodeHeader.Pack())
+
+                    # Write keyframe table (frame -> key index, the game reads it, the keys must be increasing)
+                    keys = [x.Key for x in node.Frames]
+                    frameTable = self.FillArray(keys, self.FrameCount + 1)
+                    issues = frame_table_issues(keys, frameTable, self.FrameCount)
+                    if issues:
+                        raise ValueError(f"{trackName} {nameInt:#010x}: {'; '.join(issues)}")
+                    keyFrameOffset = writer.tell()
+                    writer.write(b''.join(struct.pack("<H", x) for x in frameTable))
+                    self.WriteAlignment(writer, 4, 0)
+
+                    # Write different keyframe table
+                    differentKeyFrameOffset = writer.tell()
+                    writer.write(b''.join(struct.pack("<H", frame.Key) for frame in node.Frames))
+                    self.WriteAlignment(writer, 4, 0)
+
+                    # Write animation data
+                    dataOffset = writer.tell()
+                    writer.write(b''.join(self.ValueToBytesV1(frame.Value) for frame in node.Frames))
+
+                    if dataByteSize != 4:
+                        self.WriteAlignment(writer, 4, 0)
+
+                    tableHeader = animation_support.TableHeader(
+                        nodeOffset,
+                        keyFrameOffset,
+                        differentKeyFrameOffset,
+                        dataOffset,
+                        0,
+                    )
+
+                    # Update offset
+                    nodeOffset = writer.tell()
+
+                    # Write header table
+                    writer.seek(headerPos)
+                    writer.write(tableHeader.Pack())
+                    headerPos = writer.tell()
+
+            # Memory the game reserves: the decompressed data and 88 bytes per node
+            header.DecompSize = len(writer.getvalue()) + 88 * self.CountHashes()
+            writerDecomp.write(compressor.compress(writer.getvalue()))
+
+    def SaveAnimationDataV2(self, writerDecomp, header):
+        for track in self.Tracks:
+            for node in track.Nodes:
+                sort_frames(node)
+
+        with BytesIO() as writer:
+            hashCount = self.CountHashes()
+
+            # The BoneBool nodes index a second list of names, after the names of the other tracks
+            nameHashes = self.GetNameHashes()
+            boolHashes = self.GetBoolHashes()
+            hashCountDistinct = len(nameHashes) + len(boolHashes)
+
+            # Write data header
+            writer.write(pack("<I", 0x0C))
+            writer.write(pack("<I", 0x0C + hashCountDistinct * 4))
+            writer.write(pack("<I", (0x0C + hashCountDistinct * 4) + 4 * 10))
+            
+            # Write name hash
+            for i in nameHashes + boolHashes:
+                writer.write(pack("<I", i))
+                    
+            # Store position
+            trackOffset = writer.tell() + 4 * 2
+            trackDataOffset = writer.tell() + 4 * 2
+            tableOffset = (0x0C + hashCountDistinct * 4) + 4 * 10
+            dataOffset = tableOffset + hashCount * 16
+            
+            # Loop in tracks
+            for i in range(4):
+                # Write track offset
+                writer.seek(0x0C + hashCountDistinct * 4 + i * 2)
+                writer.write(pack("<H", trackOffset))
+                trackOffset += 8
+                
+                # Set track struct
+                track  = animation_support.Track(0, 0, 0, 0, 0, 0)
+                if i < len(self.Tracks):
+                    myTrack = self.Tracks[i]
+                    if len(myTrack.Nodes) > 0:
+                        track.Type = next((key for key, value in animation_support.TrackType.items() if value == myTrack.Name), None) & 0xFF
+                        track.DataType = animation_support.TrackDataType[myTrack.Name] & 0xFF
+                        track.Unk = 0
+                        track.DataCount = animation_support.TrackDataCount[myTrack.Name] & 0xFF
+                        track.Start = 0
+                        track.End = self.FrameCount & 0xFFFF
+                        
+                        for node in myTrack.Nodes:
+                            # Write table header
+                            writer.seek(tableOffset)
+                            writer.write(pack("<I", dataOffset))
+                            writer.write(pack("<I", dataOffset + 4))
+                            tableOffset += 8
+                            
+                            # Write data
+                            writer.seek(dataOffset)
+                            if myTrack.Name == "BoneBool":
+                                writer.write(pack("<H", boolHashes.index(node.Name)))
+                            else:
+                                writer.write(pack("<H", nameHashes.index(node.Name)))
+                            
+                            # Key count on 13 bits, interpolation on the 3 high bits
+                            writer.write(pack("<H", (len(node.Frames) & 0x1FFF) | (node.Interpolation << 13)))
+                                
+                            # Write frames
+                            for x in node.Frames:
+                                writer.write(pack("<H", x.Key))
+                            self.WriteAlignment(writer, 4, 0)
+                            
+                            # Keep value offset
+                            valueOffset = writer.tell()
+                            for frame in node.Frames:
+                                writer.write(frame.Value.ToBytes())
+
+                            # The next node starts on 4 bytes (the bool values are 1 byte)
+                            self.WriteAlignment(writer, 4, 0)
+
+                            # Update data offset
+                            dataOffset = writer.tell()
+                            
+                            # Finish to write table header
+                            writer.seek(tableOffset)
+                            writer.write(pack("<I", valueOffset))
+                            writer.write(pack("<I", 0x00))
+                            tableOffset += 8
+                            
+                # Write track data
+                writer.seek(trackDataOffset)
+                writer.write(track.Pack())
+                trackDataOffset += 8
+            
+            # Memory the game reserves: the decompressed data and 84 bytes per node
+            header.DecompSize = len(writer.getvalue()) + 84 * hashCount
+            writerDecomp.write(compressor.compress(writer.getvalue()))
+    
+    def ReadFrameDataV1(self, reader, tableOffset, trackNum, trackIndex):
+        # Read offset table
+        reader.seek(tableOffset)
+        tableHeader = animation_support.TableHeader.Unpack(reader)
+        tableOffset = reader.tell()
+        
+        # Read node
+        reader.seek(tableHeader.NodeOffset)
+        node = animation_support.Node.Unpack(reader)
+        
+        # Add the track if it doesn't exist
+        if all(t.Index != trackNum for t in self.Tracks) and node.NodeType != 0:
+            self.Tracks.append(Track(animation_support.TrackType[node.NodeType], trackNum))
+            
+        # Get different frame index (one key per data entry, in data order)
+        reader.seek(tableHeader.DifferentKeyFrameOffset)
+        differentFrames = [unpack("<H", reader.read(2))[0] for i in range(node.FrameLength // 2)]
+        frames = []
+
+        # Frame -> key index table: the game picks the key of a frame here, not in the key list (sub_17C864)
+        reader.seek(tableHeader.KeyFrameOffset)
+        frameTable = [unpack("<H", reader.read(2))[0] for i in range(node.DifferentFrameCount)]
+        
+        for j in range(len(differentFrames)):
+            # Get frame
+            frame = differentFrames[j]
+            
+            # Seek data offset
+            reader.seek(tableHeader.DataOffset + j * node.DataVectorSize * node.DataByteSize)
+            animData = [None] * node.DataVectorSize
+            
+            # Decode animation data
+            for k in range(node.DataVectorSize):
+                # V1 rotations have DataType 1 but are stored as floats, the byte size tells them apart from shorts
+                if node.DataType == 1 and node.DataByteSize == 2:
+                    animData[k] = unpack("<h", reader.read(2))[0] / 0x7FFF
+                elif node.DataType == 2 or (node.DataType == 1 and node.DataByteSize == 4):
+                    animData[k] = unpack("<f", reader.read(4))[0]
+                elif node.DataType == 3:
+                    animData[k] = unpack("<f", reader.read(4))[0]
+                elif node.DataType == 4:
+                    animData[k] = unpack("<b", reader.read(1))[0]
+                else:
+                    raise Exception(f"Data type: {node.DataType} not implemented")
+
+            frames.append(Frame(frame, self.ConvertAnimDataToObject(animData, node.NodeType)))
+
+        # The group decides the interpolation, the game never reads the byte of the node
+        interpolation = animation_support.INTERPOLATION_LINEAR
+        if trackNum == 3:
+            interpolation = animation_support.INTERPOLATION_CONSTANT
+
+        resultNode = Node(node.BoneNameHash, interpolation, frames)
+        resultNode.FrameTable = frameTable
+        resultNode.TableLength = node.DifferentFrameCount
+        resultNode.KeyIssues = frame_table_issues(differentFrames, frameTable, self.FrameCount)
+        for issue in resultNode.KeyIssues:
+            self.KeyIssues.append((self.Tracks[trackIndex].Name, node.BoneNameHash, issue))
+        self.Tracks[trackIndex].Nodes.append(resultNode)
+        
+        return tableOffset
+    
+    def ReadFrameDataV2(self, reader, offset, count, dataOffset, nameHashes, track, trackIndex):
+        for i in range(offset, offset + count):
+            reader.seek(dataOffset + 4 * 4 * i)
+            flagOffset = unpack("<I", reader.read(4))[0]
+            keyFrameOffset = unpack("<I", reader.read(4))[0]
+            keyDataOffset = unpack("<I", reader.read(4))[0]
+            reader.seek(flagOffset)
+            index = unpack("<H", reader.read(2))[0]
+            nameHash = nameHashes[index]
+            keyFrameCountFlag = unpack("<H", reader.read(2))[0]
+            keyFrameCount = keyFrameCountFlag & 0x1FFF
+
+            # Mode 0 copies the key without blending, every other mode interpolates
+            interpolation = animation_support.INTERPOLATION_LINEAR
+            if keyFrameCountFlag >> 13 == 0:
+                interpolation = animation_support.INTERPOLATION_CONSTANT
+
+            reader.seek(keyDataOffset)
+            frames = []
+            for k in range(keyFrameCount):
+                temp = reader.tell()
+                reader.seek(keyFrameOffset + k * 2)
+                frame = unpack("<H", reader.read(2))[0]
+                reader.seek(temp)
+                animData = [None] * track.DataCount
+                
+                for j in range(track.DataCount):
+                    if track.DataType == 1:
+                        animData[j] = unpack("<h", reader.read(2))[0] / 0x7FFF
+                    elif track.DataType == 2:
+                        animData[j] = unpack("<f", reader.read(4))[0]
+                    elif track.DataType == 3:
+                        animData[j] = unpack("<f", reader.read(4))[0]
+                    elif track.DataType == 4:
+                        animData[j] = unpack("<b", reader.read(1))[0]
+                    else:
+                        raise Exception(f"Data type: {track.DataType} not implemented")
+
+                frames.append(Frame(frame, self.ConvertAnimDataToObject(animData, track.Type)))
+
+            # Create node
+            self.Tracks[trackIndex].Nodes.append(Node(nameHash, interpolation, frames))
+    
+    def ConvertAnimDataToObject(self, animData, Type):
+        if Type == 1:
+            return BoneLocation(animData[0], animData[1], animData[2])
+        elif Type == 2:
+            return BoneRotation(animData[0], animData[1], animData[2], animData[3])
+        elif Type == 3:
+            return BoneScale(animData[0], animData[1], animData[2])
+        elif Type == 4:
+            return UVMove(animData[0], animData[1])
+        elif Type == 5:
+            return UVScale(animData[0], animData[1])
+        elif Type == 6:
+            return UVRotate(animData[0])
+        elif Type == 7:
+            return Transparency(animData[0])
+        elif Type == 8:
+            return MaterialAttribute(animData[0], animData[1], animData[2])
+        elif Type == 9:
+            return BoneBool(animData[0])
+        else:
+            raise Exception(f"Data Type: {Type} not implemented")
+    
+    def ValueToByteArray(self, value): # Useless
+        return value.ToBytes()
+    
+    def ValueToBytesV1(self, value):
+        # V1 stores rotations as float quaternions, V2 as normalized shorts
+        if isinstance(value, BoneRotation):
+            return pack("<ffff", value.X, value.Y, value.Z, value.W)
+        
+        return value.ToBytes()
+    
+    def GetDistincHashes(self):
+        hashes = set()
+        
+        for track in self.Tracks:
+            hashes.update(node.Name for node in track.Nodes)
+            
+        return len(hashes)
+    
+    def CountHashes(self):
+        return sum(len(track.Nodes) for track in self.Tracks)
+    
+    def GetNameHashes(self):
+        """Distinct node names of the tracks, the BoneBool nodes have their own list in V2."""
+        nameHashes = []
+
+        for track in self.Tracks:
+            if track.Name == "BoneBool":
+                continue
+
+            for node in track.Nodes:
+                if node.Name not in nameHashes:
+                    nameHashes.append(node.Name)
+
+        return nameHashes
+
+    def GetBoolHashes(self):
+        boolHashes = []
+
+        for track in self.Tracks:
+            if track.Name == "BoneBool":
+                for node in track.Nodes:
+                    boolHashes.append(node.Name)
+
+        return boolHashes
+    
+    def FillArray(self, inputArray: list, size):
+        result = [0] * size
+        lastIndex = 0
+        
+        for i in range(len(inputArray)):
+            nextValue = 0
+            lastValue = inputArray[i]
+            
+            if i != (len(inputArray) - 1):
+                nextValue = inputArray[i + 1]
+            else:
+                nextValue = size
+                
+            for j in range(lastValue, min(nextValue, size)):
+                result[j] = lastIndex
+            lastIndex += 1
+            
+        return result
+    
+    def FixNode(self, nodes: list[Node], frameCount):
+        for node in nodes:
+            if node.Frames and node.Frames[-1].Key != frameCount:
+                node.Frames.append(Frame(frameCount, node.Frames[-1].Value))
+    
+    def WriteAlignment(self, writer, alignment=16, alignment_byte=0x0):
+        remainder = writer.tell() % alignment
+        
+        if remainder == 0:
+            return
+            
+        padding = alignment - remainder
+        writer.write(bytes([alignment_byte] * padding))
