@@ -116,7 +116,7 @@ The **TEMPLATE** bar at the bottom of the assets panel only appears in a templat
 
 *File > Export > .mp4…* exports all frames at 30 fps in 800×480, with the current camera mode.
 
-Right-click an asset > *Export…* saves it in a common format (`export.py`):
+Right-click an asset > *Export…* saves it in a common format (`export/`, one module per format):
 
 * a model (an archive with meshes, or a custom object, its parts on one skeleton): `.dae` (Collada), `.fbx`
   (binary, readable by Blender) or `.obj`; the textures are written as `.png` next to it. `.dae` and `.fbx` hold the
