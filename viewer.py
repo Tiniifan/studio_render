@@ -15,6 +15,7 @@ from PySide6.QtSvg import QSvgRenderer
 import asset_windows
 import assets as assets_module
 import eleven
+import export as export_module
 import images
 import model as model_module
 import offscreen as offscreen_module
@@ -1561,6 +1562,9 @@ class AssetPanel(QtWidgets.QWidget):
                                        LOCK_BADGES.get(asset.lock or (asset.parent.lock if asset.parent else None), ("", "", FAINT))[2]),
                                   lock[0].upper() + lock[1:])
             note.setEnabled(False)
+        if export_module.asset_formats(asset):
+            menu.addSeparator()
+            menu.addAction("Export…", lambda: window.export_asset(asset))
         if project.animatable(asset):
             menu.addSeparator()
             self.animation_menu(menu, asset)
@@ -2130,6 +2134,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thumbnail_queue = []
         self._toast_timer = QtCore.QTimer(self, singleShot=True, interval=2200)
         self._last_folder = ""
+        self._last_export_folder = ""
 
         self.assets_panel = AssetPanel(self)
         self.player = PlayerPanel(self)
@@ -3226,6 +3231,39 @@ class MainWindow(QtWidgets.QMainWindow):
             if asset.kind == assets_module.MODEL and asset.model is not None and not asset.thumbnail:
                 self.queue_thumbnail(asset)
         return True
+
+    def export_asset(self, asset):
+        """Export… of the asset menu: a save dialog with the formats of the asset (export.asset_formats)."""
+        formats = export_module.asset_formats(asset)
+        if not formats:
+            return
+        filters = export_module.file_filter(formats).split(";;")
+        folder = self._last_export_folder or self._last_folder
+        suggested = os.path.join(folder, export_module.file_name(asset.stem, "export") + formats[0])
+        path, chosen = QtWidgets.QFileDialog.getSaveFileName(self, f"Export {asset.name}", suggested, ";;".join(filters))
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += formats[filters.index(chosen)] if chosen in filters else formats[0]
+        self._last_export_folder = os.path.dirname(path)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            written = export_module.export_asset(asset, path)
+        except export_module.ExportError as error:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, APP, f"{asset.name} was not exported: {error}.")
+            return
+        except Exception as error:
+            traceback.print_exc()
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, APP, f"{asset.name} could not be exported: {error}")
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        others = sum(1 for p in written[1:] if p.lower().endswith(".png"))
+        noun = "image" if path.lower().endswith(".png") else "texture"
+        extra = f" (+ {others} {noun}{'s' if others > 1 else ''})" if others else ""
+        self.show_toast(f"<b style='color:{ACCENT}'>{asset.name}</b> exported to "
+                        f"<b style='color:{ACCENT}'>{os.path.basename(path)}</b>{extra}")
 
     def write_project_as(self):
         return self.write_project(ask=True)

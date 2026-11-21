@@ -116,6 +116,17 @@ The **TEMPLATE** bar at the bottom of the assets panel only appears in a templat
 
 *File > Export > .mp4…* exports all frames at 30 fps in 800×480, with the current camera mode.
 
+Right-click an asset > *Export…* saves it in a common format (`export.py`):
+
+* a model (an archive with meshes, or a custom object, its parts on one skeleton): `.dae` (Collada), `.fbx`
+  (binary, readable by Blender) or `.obj`; the textures are written as `.png` next to it. `.dae` and `.fbx` hold the
+  skeleton with its rest pose and the skin weights, `.obj` only the geometry as drawn at rest;
+* a skeleton (nodes without mesh): `.dae` or `.fbx`;
+* an image (`.xi`, image archive, `.png`, `.jpg`) or a text: `.png`.
+
+The archives of a package have the entry, the package itself does not. Files are written Y up, 1 unit = 1 m
+(Blender turns them Z up on import, like studio_eleven).
+
 ## Command line
 
 You can pass files (or a `.srp`) on the command line. `--object NAME=A,B,C` creates a custom object,
