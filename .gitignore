@@ -26,3 +26,8 @@ out/
 # Local documents
 docs/
 /build_venv
+
+# Tests: local fixture paths (game data stays outside the repository), reference screenshots (derived from game data)
+tests/fixtures.local.toml
+tests/references/
+.pytest_cache/
