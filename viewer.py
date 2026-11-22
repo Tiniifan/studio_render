@@ -800,6 +800,8 @@ class Tile(QtWidgets.QWidget):
             tip += "\n\n" + asset.error
         if project.reference is asset:
             tip += "\nReference script"
+        if project.map is asset:
+            tip += "\nMap: drawn before the other models"
         lock = project.lock_text(asset)
         if lock:
             tip += "\n\n" + lock[0].upper() + lock[1:]
@@ -863,6 +865,8 @@ class Tile(QtWidgets.QWidget):
             draw_icon(painter, "star", ACCENT, badge.adjusted(3, 2, -3, -2))
         if self.asset.kind == assets_module.CUSTOM:
             self._flag(painter, rect, "object", MUTED)
+        elif project.map is self.asset:
+            self._flag(painter, rect, "map", ACCENT)
         elif self.asset.parent is None:
             users = project.users_of(self.asset)
             if users:
@@ -1571,6 +1575,12 @@ class AssetPanel(QtWidgets.QWidget):
         elif asset.kind == assets_module.ANIMATION:
             menu.addSeparator()
             self.targets_menu(menu, asset)
+        if project.can_be_map(asset):
+            menu.addSeparator()
+            labelled = project.map is asset
+            label = menu.addAction("Map", lambda: window.set_map(None if labelled else asset))
+            label.setCheckable(True)
+            label.setChecked(labelled)
         if asset.is_picture:
             menu.addSeparator()
             if project.layer_of(asset) is None:
@@ -2930,6 +2940,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_reference(self, asset):
         self.project.set_reference(asset)
+        self.scene_changed()
+
+    def set_map(self, asset):
+        self.project.set_map(asset)
         self.scene_changed()
 
     def toggle_visible(self, asset):

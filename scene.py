@@ -15,7 +15,8 @@ import model as model_module
 
 
 class DrawItem:
-    __slots__ = ("model", "mesh", "matrix", "positions", "normals", "tint", "uv_rows", "outline")
+    __slots__ = ("model", "mesh", "matrix", "positions", "normals", "tint", "uv_rows", "outline", "entry", "bucket",
+                 "bucket_index", "model_index")
 
 
 SKIN_TEXTURE_PREFIX = "uas"     # grey skin texture of the bodies (uas0001), tinted by PRIMARY_COLOR (#FIX_TON_12)
@@ -96,6 +97,7 @@ class Scene:
         self.hidden_at = None          # frame -> entries not drawn at that frame (the script of a template)
         self.camera_order = None       # () -> cameras played in order, None for all of them as imported
         self.frame_map = None          # (entry, frame) -> frame of its animations (the split of the cut it plays)
+        self.map_entries = None        # () -> entries drawn before the queue of the others (the asset labelled map)
         self._skins = {}
 
     # Loading
@@ -271,6 +273,20 @@ class Scene:
             self._skins[key] = colors[0] if colors else None
         return self._skins[key]
 
+    def draw_list(self, frame, camera_rotation):
+        """The draw items of every visible entry in one queue, as the game sorts it (sub_18680C): by bucket, rank in the
+        bucket inside its model, then order of the model in the scene. An archive loaded after another no longer
+        covers it whatever their buckets. The map is drawn first: the outlines of the characters, which write no
+        depth, would otherwise be covered by the meshes of the stadium queued after them."""
+        first = self.map_entries() if self.map_entries is not None else ()
+        items = []
+        for model_index, entry in enumerate(self.visible_entries(frame)):
+            for item in self.evaluate(entry, frame, camera_rotation):
+                item.model_index = model_index
+                items.append(item)
+        items.sort(key=lambda item: (item.entry not in first, item.bucket, item.bucket_index, item.model_index))
+        return items
+
     def evaluate(self, entry, frame, camera_rotation):
         if self.frame_map is not None:
             frame = self.frame_map(entry, frame)
@@ -307,6 +323,9 @@ class Scene:
             item = DrawItem()
             item.model = model
             item.mesh = mesh
+            item.entry = entry
+            item.bucket, item.bucket_index = mesh.bucket, entry.bucket_index[index]
+            item.model_index = 0
             item.tint = tint
             item.outline = outline
             item.positions, item.normals = None, None

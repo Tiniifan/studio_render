@@ -454,19 +454,24 @@ class Renderer:
         lights = [lighting.default_light()]
         camera_rotation = view.camera_rotation()
 
-        for entry in scene.visible_entries(frame):
-            draws = scene.evaluate(entry, frame, camera_rotation)
-            if not draws:
-                continue
-            engine_id = entry.engine_id
-            scene_ambient = (eleven.engines().get_scene_ambient(engine_id),) * 3
-            outline_items = [d for d in draws if d.outline is not None] if self.draw_outlines else []
+        draws = scene.draw_list(frame, camera_rotation)
+        # The outlines of a model are drawn before its first mesh in the queue
+        outlines = {}
+        if self.draw_outlines:
+            for item in draws:
+                if item.outline is not None:
+                    outlines.setdefault(item.entry, []).append(item)
+        ambients = {}
+        for item in draws:
+            entry = item.entry
+            outline_items = outlines.pop(entry, None)
             if outline_items:
                 size_ndc = self._size_ndc(outline_items, view)
-                for item in outline_items:
-                    self._draw_outline(fbo, entry, item, view, size_ndc)
-            for item in draws:
-                self._draw_mesh(fbo, entry, item, view, lights, scene_ambient)
+                for outline_item in outline_items:
+                    self._draw_outline(fbo, entry, outline_item, view, size_ndc)
+            if entry not in ambients:
+                ambients[entry] = (eleven.engines().get_scene_ambient(entry.engine_id),) * 3
+            self._draw_mesh(fbo, entry, item, view, lights, ambients[entry])
 
         self._reset_state(fbo)
 

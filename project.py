@@ -243,6 +243,7 @@ class Project:
         self.dirty = False
         self.items = []             # top level assets, in import order
         self.reference = None       # reference script
+        self.map = None             # the asset labelled map (a stadium): drawn before the other models
         self.bindings = []          # (animation asset, model asset or custom object)
         self.template = None        # Template of a template project
         self.layers = []            # pictures in the timeline, drawn in this order (the last one on top)
@@ -252,6 +253,7 @@ class Project:
         self.scene.hidden_at = self.hidden_at
         self.scene.camera_order = self.camera_order
         self.scene.frame_map = self.frame_map
+        self.scene.map_entries = self.map_entries
         self.scene.engine_id = engine_id
 
     # Queries
@@ -642,6 +644,8 @@ class Project:
             siblings.remove(asset)
         if self.reference is asset:
             self.reference = next(iter(self.scripts()), None)
+        if self.map is asset:
+            self.map = None
         self._member_visibility()
         self.touch()
 
@@ -720,6 +724,7 @@ class Project:
         if relink:
             child_targets = {}
         was_reference = self.reference is old
+        was_map = self.map is old
         layer = self.layer_of(old)
 
         gone = [old] + old.children
@@ -779,6 +784,8 @@ class Project:
                 lost.append(f"{child_name} is not in {new.name}: {target.name} lost its animation")
         if was_reference:
             self.reference = new if new.kind == assets_module.SQUIRREL else next(iter(self.scripts()), None)
+        if was_map:
+            self.map = new if self.can_be_map(new) else None
         if relink or (self.template is not None and new.is_package):
             self.auto_bind()
         self._member_visibility()
@@ -829,6 +836,25 @@ class Project:
         if asset is not self.reference:
             self.reference = asset
             self.touch()
+
+    def can_be_map(self, asset):
+        """An asset with meshes of its own (an archive, a package): it can carry the map label."""
+        return asset.kind != assets_module.CUSTOM and any(entry.has_meshes for each in [asset] + asset.children
+                                                          for entry in self.scene.owned(each))
+
+    def set_map(self, asset):
+        """Labels an asset as the map, None clears the label: a project has one map, the label moves to the new one."""
+        if asset is not None and not self.can_be_map(asset):
+            raise ProjectError(f"{asset.name} has no model, it cannot be the map.")
+        if asset is not self.map:
+            self.map = asset
+            self.touch()
+
+    def map_entries(self):
+        """Entries of the asset labelled map (of its archives for a package), drawn before the queue of the others."""
+        if self.map is None:
+            return set()
+        return {entry for each in [self.map] + self.map.children for entry in self.scene.owned(each)}
 
     # Animation bindings
 
@@ -979,6 +1005,7 @@ class Project:
                                      "members": [member.path for member in custom.members]},
                                     **({"lock": custom.lock} if custom.lock else {})) for custom in self.customs()],
             "reference_script": self.reference.path if self.reference is not None else None,
+            "map": self.map.path if self.map is not None else None,
             "bindings": [{"animation": source.path, "model": target.path} for source, target in self.bindings],
             "layers": [layer.to_json() for layer in self.layers],
         }
@@ -1063,6 +1090,10 @@ class Project:
                 if _preview_path(custom) in names:
                     custom.thumbnail = archive.read(_preview_path(custom))
 
+        map_path = data.get("map")
+        project.map = project.find(map_path) if map_path else None
+        if project.map is not None and not project.can_be_map(project.map):
+            project.map = None
         reference = data.get("reference_script")
         project.reference = project.find(reference) if reference else None
         if project.reference is None or project.reference.kind != assets_module.SQUIRREL:

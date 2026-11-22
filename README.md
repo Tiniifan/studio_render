@@ -40,6 +40,9 @@ Import files with *+ Import* or drag-and-drop them onto the window. A model show
 (skeleton, animation, cameras, light, images, script) show their icon.
 
 * Right-click: *Rename* (`F2`), *Replace…* (another file takes its place), *Remove* (`Del`).
+* Right-click a model > *Map*: labels it as the stadium, drawn before the other models (only one map per
+  project: labelling another asset moves the label). Without it, the meshes of a stadium queued after the
+  characters can cover their outlines.
 * Double-click: open the asset alone (a model, with its own animations), the script editor or the image.
 
 ### Images and texts
