@@ -92,6 +92,10 @@ class Mesh:
         return (self.draw_priority >> 8) & 3
 
 
+# Split (plan) files per kind of animation: the game shifts the UV and material ranges one frame after the bone ones
+SPLIT_KINDS = {".mtninf": "bone", ".imminf": "uv", ".mtminf": "material"}
+
+
 class Model:
     def __init__(self, name):
         self.name = name
@@ -104,7 +108,8 @@ class Model:
         self.texprojs = []          # (texproj hash, material name, uv index)
         self.outlines = []
         self.animations = {}        # animation name -> [AnimationManager]
-        self.splits = {}            # animation hash -> [split dicts]
+        self.splits = {}            # animation hash -> [split dicts], of the bone animations when there are any
+        self.kind_splits = {kind: {} for kind in SPLIT_KINDS.values()}     # "bone" / "uv" / "material" -> splits
         self.cameras = []
         self.library = None         # render library of the archive (custom combiners)
         self.library_files = {"cmb": {}, "lut": {}, "shdc": {}}
@@ -444,6 +449,7 @@ def read(data, name):
             print(f"[studio_render] {name}/{file_name}: {error}")
 
     manager, minf = eleven.animation_manager(), eleven.minf()
+    first_splits = {}       # the first split of each name whatever its kind, for an archive without .mtninf
     for file_name in sorted(files):
         content = files[file_name]
         if file_name.endswith((".mtn2", ".imm2", ".mtm2", ".mtn3", ".imm3", ".mtm3")):
@@ -452,18 +458,22 @@ def read(data, name):
                 model.animations.setdefault(animation.AnimationName, []).append(animation)
             except Exception as error:
                 print(f"[studio_render] {name}/{file_name}: {error}")
-        elif file_name.endswith((".mtninf", ".imminf", ".mtminf")):
+        elif file_name.endswith(tuple(SPLIT_KINDS)):
             try:
                 _, split_name, animation_hash, start, end, speed = minf.open_minf1(content)
-                splits = model.splits.setdefault(animation_hash, [])
-                if all(split["name"] != split_name for split in splits):
-                    splits.append({"name": split_name, "start": start, "end": end, "speed": speed})
             except Exception:
-                pass
+                continue
+            split = {"name": split_name, "start": start, "end": end, "speed": speed}
+            kind = SPLIT_KINDS[file_name[file_name.rfind("."):]]
+            for splits in (model.kind_splits[kind].setdefault(animation_hash, []), first_splits.setdefault(animation_hash, [])):
+                if all(other["name"] != split_name for other in splits):
+                    splits.append(dict(split))
         elif file_name.endswith((".cmb", ".lut")) and file_name[:3].isdigit():
             model.library_files[file_name[-3:]][int(file_name[:3])] = content
         elif file_name.endswith(".shdc") and file_name[3:6].isdigit():
             model.library_files["shdc"][int(file_name[3:6])] = content
+
+    model.splits = {key: model.kind_splits["bone"].get(key) or splits for key, splits in first_splits.items()}
 
     if "CMR.bin" in files:
         xcma, xcmt = eleven.xcma(), eleven.xcmt()

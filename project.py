@@ -486,18 +486,32 @@ class Project:
         return order
 
     def frame_map(self, entry, frame):
-        """Frame of an entry's animations: in a cut of the script, the split named after its motion ("04a"), as the game
-        sets the motion of every object of the cut; the frame itself otherwise."""
+        """Frame of an entry's animations per kind ({"bone", "uv", "material"} -> frame): in a cut of the script, the
+        frame in the split named after its motion ("04a"), as the game sets the motion of every object of the cut. The
+        bones play the split of the .mtninf, the UV and material animations that of their own .imminf / .mtminf (the
+        game starts them one frame later), the bone frame without one; the frame itself outside a scripted template."""
         if not self.scene.scripted():
-            return frame
+            return dict.fromkeys(("bone", "uv", "material"), frame)
         index, local = self.scene.camera_index_at(frame)
         motion = self._scripted().motions[index]
-        for model in [entry.model] + [source.model for source in entry.bound]:
-            for splits in model.splits.values():
-                split = next((s for s in splits if s["name"] == motion), None)
-                if split is not None:
-                    return float(split["start"]) + min(local, float(split["end"]) - float(split["start"]))
-        return frame
+        models = [entry.model] + [source.model for source in entry.bound]
+
+        def mapped(tables):
+            for table in tables:
+                for splits in table.values():
+                    split = next((s for s in splits if s["name"] == motion), None)
+                    if split is not None:
+                        return float(split["start"]) + min(local, float(split["end"]) - float(split["start"]))
+            return None
+
+        # The splits of a model are those of its .mtninf, else the first file of each name (an archive without .mtninf)
+        bone = mapped(model.splits for model in models)
+        bone = frame if bone is None else bone
+        frames = {"bone": bone}
+        for kind in ("uv", "material"):
+            own = mapped(model.kind_splits.get(kind, {}) for model in models)
+            frames[kind] = bone if own is None else own
+        return frames
 
     def cut_at(self, frame):
         """(cut from 0, frame in its camera) of the game camera at a frame: the cut of the script when it orders the

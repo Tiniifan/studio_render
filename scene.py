@@ -96,7 +96,7 @@ class Scene:
         self.revision = 0
         self.hidden_at = None          # frame -> entries not drawn at that frame (the script of a template)
         self.camera_order = None       # () -> cameras played in order, None for all of them as imported
-        self.frame_map = None          # (entry, frame) -> frame of its animations (the split of the cut it plays)
+        self.frame_map = None          # (entry, frame) -> {"bone", "uv", "material"} -> frame of its animations
         self.map_entries = None        # () -> entries drawn before the queue of the others (the asset labelled map)
         self._skins = {}
 
@@ -287,13 +287,18 @@ class Scene:
         items.sort(key=lambda item: (item.entry not in first, item.bucket, item.bucket_index, item.model_index))
         return items
 
+    def animation_frames(self, entry, frame):
+        """{"bone", "uv", "material"} -> frame each kind of animation of an entry plays at a frame of the scene."""
+        if self.frame_map is None:
+            return dict.fromkeys(("bone", "uv", "material"), frame)
+        return self.frame_map(entry, frame)
+
     def evaluate(self, entry, frame, camera_rotation):
-        if self.frame_map is not None:
-            frame = self.frame_map(entry, frame)
+        frames = self.animation_frames(entry, frame)
         model = entry.model
         animations = entry.animations
         pose = entry.pose
-        pose.update(animations, frame, camera_rotation)
+        pose.update(animations, frames["bone"], camera_rotation)
         palette = pose.palette()
         uv_animations = [a for a in animations if a.kind == "uv"]
         material_animations = [a for a in animations if a.kind == "material"]
@@ -311,10 +316,10 @@ class Scene:
                 if skin_color:
                     tint[:3] = skin_color
             for anim in material_animations:
-                value = anim.value(material_hash, "transparency", frame)
+                value = anim.value(material_hash, "transparency", frames["material"])
                 if value is not None:
                     tint[3] = float(value[0])
-                value = anim.value(material_hash, "attribute", frame)
+                value = anim.value(material_hash, "attribute", frames["material"])
                 if value is not None:
                     tint[:3] = [float(v) for v in value[:3]]
             if tint[3] < 0.001:
@@ -344,13 +349,13 @@ class Scene:
                 move, scale, rotate = (0.0, 0.0), (1.0, 1.0), 0.0
                 if texproj is not None:
                     for anim in uv_animations:
-                        value = anim.value(texproj, "move", frame)
+                        value = anim.value(texproj, "move", frames["uv"])
                         if value is not None:
                             move = (float(value[0]), float(value[1]))
-                        value = anim.value(texproj, "scale", frame)
+                        value = anim.value(texproj, "scale", frames["uv"])
                         if value is not None:
                             scale = (float(value[0]), float(value[1]))
-                        value = anim.value(texproj, "rotate", frame)
+                        value = anim.value(texproj, "rotate", frames["uv"])
                         if value is not None:
                             rotate = float(value[0])
                 item.uv_rows.append(animation.uv_rows(move, scale, rotate))

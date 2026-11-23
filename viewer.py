@@ -303,7 +303,7 @@ class GLView(QOpenGLWidget):
                         # The playback evaluates the poses itself, the window keeps its time for the frames
                         break
                     _, entry, frame, frames = work
-                    mapped = scene.frame_map(entry, float(frame)) if scene.frame_map is not None else float(frame)
+                    mapped = scene.animation_frames(entry, float(frame))["bone"]
                     entry.pose.update(entry.animations, mapped)
                     if frame + 1 < frames:
                         self._prepare[0] = ("poses", entry, frame + 1, frames)
