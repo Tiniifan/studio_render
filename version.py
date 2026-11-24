@@ -1,5 +1,5 @@
 """Version of studio_render, written in the projects (.srp) it saves."""
-VERSION = "1.3.3.0"
+VERSION = "1.3.4.0"
 
 
 def parse(text):
