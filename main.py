@@ -72,7 +72,7 @@ def screenshot(args):
     for frame in frames:
         camera = scene.camera_at(frame) if args.game_camera else None
         if camera is not None:
-            view.update_game(*camera)
+            view.update_game(*camera, far=scene.game_camera_far)
         else:
             view.update_orbit()
         renderer.render(fbo, scene, view, float(frame))

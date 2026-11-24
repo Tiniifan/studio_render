@@ -326,7 +326,7 @@ class GLView(QOpenGLWidget):
         view.width, view.height = width, height
         pose = self.scene.camera_at(self.frame) if self.game_camera else None
         if pose is not None:
-            view.update_game(*pose)
+            view.update_game(*pose, far=self.scene.game_camera_far)
         else:
             view.update_orbit()
 
@@ -3371,7 +3371,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pose = scene.camera_at(frame) if self.gl.game_camera else None
                 free.width, free.height = width, height
                 if pose is not None:
-                    free.update_game(*pose)
+                    free.update_game(*pose, far=scene.game_camera_far)
                 else:
                     free.update_orbit()
                 writer.append(offscreen.render(scene, free, frame, width, height,

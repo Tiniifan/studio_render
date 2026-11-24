@@ -14,6 +14,20 @@ import animation, eleven
 import model as model_module
 
 
+# Far plane of the game cameras (.cmr2 / .cmr holds none), in units of the game. Inazuma Eleven GO: 6000, the far
+# value its render camera is set up with; the sky and stands of the stadium (mv01b01) reach 5934 in the techniques of
+# the game and a space background drawn at 6400 to 8000 is not shown in the game. Other engines keep 10000: no value
+# of theirs is known.
+GAME_CAMERA_FAR = {"IE4": 6000.0}
+DEFAULT_GAME_CAMERA_FAR = 10000.0
+
+
+def game_camera_far(engine_id):
+    """Far plane of the game cameras of a scene drawn with an engine (the first engine of a composite one: the game
+    it runs in)."""
+    return GAME_CAMERA_FAR.get(eleven.engine_parts(engine_id)[0], DEFAULT_GAME_CAMERA_FAR)
+
+
 class DrawItem:
     __slots__ = ("model", "mesh", "matrix", "positions", "normals", "tint", "uv_rows", "outline", "entry", "bucket",
                  "bucket_index", "model_index")
@@ -300,6 +314,10 @@ class Scene:
             return None
         return camera.at(local)
 
+    @property
+    def game_camera_far(self):
+        return game_camera_far(self.engine_id)
+
     def camera_starts(self):
         """First frame of each camera."""
         starts, frame = [], 0
@@ -502,7 +520,8 @@ class View:
         self.view = self._rolled(self.look_at(self.eye(), self.target, up), self.roll)
         self.projection = self.perspective(self.fov, self.width / max(self.height, 1), self.near, self.far)
 
-    def update_game(self, location, aim, fov, roll, near=1.0, far=10000.0):
+    def update_game(self, location, aim, fov, roll, near=1.0, far=DEFAULT_GAME_CAMERA_FAR):
+        """The view of a game camera; far: Scene.game_camera_far of the scene it draws."""
         self.view = self._rolled(self.look_at(location, aim, (0.0, 1.0, 0.0)), roll)
         self.projection = self.perspective(fov, self.width / max(self.height, 1), near, far)
 

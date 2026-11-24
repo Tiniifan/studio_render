@@ -77,7 +77,8 @@ one, so a GO technique can blink and speak with these heads.
 
 ### Player
 
-* *Game camera* (cameras from the `.xv` archive) or *Free*.
+* *Game camera* (cameras from the `.xv` archive) or *Free*. A camera file has no far plane: the game cameras of
+  Inazuma Eleven GO (IE4) draw up to 6000 units as the game does, those of the other engines up to 10000.
 * Mouse wheel: zoom. Left click: rotate. Right click: pan.
 * Playback: `Space`, `←` `→`, `J` / `L` (−10 s / +10 s), `Home` / `End`. Speed 0.25× to 2×.
 * The camera button captures the view (*Options > Screenshot*).
