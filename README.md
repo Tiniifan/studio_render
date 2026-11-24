@@ -71,6 +71,10 @@ single object without copying files. The same file can be used by several object
 Drag an animation onto an object (or the object onto the animation) to bind them. Right-click the
 object > *Animation*, or the animation > *Animate*.
 
+The eyes and mouth of an IE5 / IE6 head (Chrono Stone, Galaxy) take their colours from a second texture
+projection that GO animations do not move: when no animation moves it, the preview moves it with the first
+one, so a GO technique can blink and speak with these heads.
+
 ### Player
 
 * *Game camera* (cameras from the `.xv` archive) or *Free*.

@@ -28,6 +28,30 @@ def is_skin_material(material):
                                         for texture, _ in material.textures)
 
 
+def uv_values(texproj, uv_animations, frame):
+    """((move, scale, rotate), animated) of a texture projection at a frame: animated is True when one of the
+    animations has a UV track for it.
+
+    The expression meshes of an IE5 / IE6 head (eyes, mouth) read the mask on texture unit 0 and its colours on unit 1.
+    A GO character animation only moves the unit 0 projection (_texproj0); Chrono Stone and Galaxy ones move the
+    _texproj1 with the same keys. Scene.evaluate gives unit 1 the values of unit 0 when no animation moves it, a
+    compensation of the preview: the game plays the _texproj1 of its own animations."""
+    move, scale, rotate = (0.0, 0.0), (1.0, 1.0), 0.0
+    animated = False
+    if texproj is not None:
+        for anim in uv_animations:
+            value = anim.value(texproj, "move", frame)
+            if value is not None:
+                move, animated = (float(value[0]), float(value[1])), True
+            value = anim.value(texproj, "scale", frame)
+            if value is not None:
+                scale, animated = (float(value[0]), float(value[1])), True
+            value = anim.value(texproj, "rotate", frame)
+            if value is not None:
+                rotate, animated = float(value[0]), True
+    return (move, scale, rotate), animated
+
+
 class Entry:
     def __init__(self, model, engine_id, path=None, owner=None):
         self.model = model
@@ -345,20 +369,13 @@ class Scene:
                     item.matrix[:3, :3] = camera_rotation * scale[None, :]
 
             item.uv_rows = []
-            for texproj in texprojs:
-                move, scale, rotate = (0.0, 0.0), (1.0, 1.0), 0.0
-                if texproj is not None:
-                    for anim in uv_animations:
-                        value = anim.value(texproj, "move", frames["uv"])
-                        if value is not None:
-                            move = (float(value[0]), float(value[1]))
-                        value = anim.value(texproj, "scale", frames["uv"])
-                        if value is not None:
-                            scale = (float(value[0]), float(value[1]))
-                        value = anim.value(texproj, "rotate", frames["uv"])
-                        if value is not None:
-                            rotate = float(value[0])
-                item.uv_rows.append(animation.uv_rows(move, scale, rotate))
+            unit_values = []
+            for unit, texproj in enumerate(texprojs):
+                values, animated = uv_values(texproj, uv_animations, frames["uv"])
+                if unit == 1 and texproj is not None and not animated and unit_values[0][1]:
+                    values = unit_values[0][0]
+                unit_values.append((values, animated))
+                item.uv_rows.append(animation.uv_rows(*values))
             items.append(item)
         return items
 
