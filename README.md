@@ -98,6 +98,10 @@ The render programs an archive holds itself are drawn as in the game: their comb
 the game) and their vertex program (`SHDnnn.shdc`, a PICA200 binary translated to GLSL by studio_eleven's
 `rendering/studio_render/vertex_binary.py`).
 
+As in the game, a mesh whose render program uses a vertex program of the other kind is not drawn: a skinned mesh
+under `#FIX_MDL` / `#FIX_SPR`, or a rigid mesh (no weights, or a single bind) under `#FIX_MDS`. Each one is printed
+in the console with its program.
+
 ### Archive cache
 
 Archives are read once, in worker processes, then kept in `%LOCALAPPDATA%\studio_render\cache` (1 GB at most, the

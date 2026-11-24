@@ -23,6 +23,42 @@ SKIN_TEXTURE_PREFIX = "uas"     # grey skin texture of the bodies (uas0001), tin
 PALETTE_SCALE = 0.25            # the mask palette of a head is RGB / 255 x 0.25 (renderer.PALETTE_SCALE)
 
 
+# Vertex programs whose kind is measured in the game files: #FIX_MDS blends the bones of the node table (skinned
+# mesh), #FIX_MDL and #FIX_SPR follow the node of the mesh (rigid mesh). No effect mesh of the game is drawn with a
+# program of the other kind, and the game shows nothing of a mesh drawn so. Other vertex programs are not judged: the
+# "skinned" flag of the render defaults is not used, #FIX_SIL_VTX says skinned and the game draws rigid meshes with it.
+VERTEX_PROGRAM_KINDS = {"#FIX_MDS": "skinned", "#FIX_MDL": "rigid", "#FIX_SPR": "rigid"}
+
+
+def is_skinned_mesh(mesh):
+    """A mesh deformed by the bones of its node table (weights), not a whole mesh on one node."""
+    return mesh.weights is not None and mesh.single_bind is None
+
+
+def render_program(model, mesh, engine_id):
+    """(name, vertex program) of the render program of a mesh: the one of the render library of the archive (RES.bin),
+    otherwise the render default of the engine with its hash; (None, None) when neither knows it."""
+    res = eleven.res()
+    for program in (model.library or {}).get("render_programs", []):
+        if res.get_name_hash(program["name"]) == mesh.render_program_hash:
+            return program["name"], program.get("vertex_program")
+    render_default = eleven.render_defaults().find_render_default_by_hash(engine_id, mesh.render_program_hash)
+    if render_default is None:
+        return None, None
+    return render_default.name, render_default.data.get("vertex_program")
+
+
+def program_mismatch(model, mesh, engine_id):
+    """Why the game does not show a mesh whose vertex program is of the other kind (skinned / rigid) than the mesh,
+    None when it is drawn (matching or unjudged program)."""
+    name, vertex_program = render_program(model, mesh, engine_id)
+    program_kind = VERTEX_PROGRAM_KINDS.get(vertex_program)
+    mesh_kind = "skinned" if is_skinned_mesh(mesh) else "rigid"
+    if program_kind is None or program_kind == mesh_kind:
+        return None
+    return f"program {name} ({vertex_program}, {program_kind}), {mesh_kind} mesh: not drawn in the game"
+
+
 def is_skin_material(material):
     return material is not None and any(texture is not None and texture.name.lower().startswith(SKIN_TEXTURE_PREFIX)
                                         for texture, _ in material.textures)
@@ -90,6 +126,21 @@ class Entry:
             outline = self.outline_of.get(zlib.crc32(mesh.name.encode("shift-jis")))
             texprojs = [self.texprojs.get((mesh.material_name, unit)) for unit in range(3)]
             self.draw_order.append((index, mesh, node, zlib.crc32(mesh.material_name.encode("shift-jis")), outline, texprojs))
+        self._hidden_meshes = None   # (engine_id, {index: reason}) of hidden_meshes
+
+    @property
+    def hidden_meshes(self):
+        """{mesh index: reason} of the meshes the game does not show: a vertex program of the other kind (skinned /
+        rigid) than the mesh. Read in the engine the entry is drawn with, each is printed once per engine."""
+        if self._hidden_meshes is None or self._hidden_meshes[0] != self.engine_id:
+            hidden = {}
+            for index, mesh in enumerate(self.model.meshes):
+                reason = program_mismatch(self.model, mesh, self.engine_id)
+                if reason is not None:
+                    hidden[index] = reason
+                    print(f"[studio_render] {self.model.name}/{mesh.name}: {reason}")
+            self._hidden_meshes = (self.engine_id, hidden)
+        return self._hidden_meshes[1]
 
     @property
     def name(self):
@@ -329,8 +380,9 @@ class Scene:
 
         items = []
         skin_color = None
+        hidden = entry.hidden_meshes
         for index, mesh, node, material_hash, outline, texprojs in entry.draw_order:
-            if node is not None and not pose.visible[node]:
+            if index in hidden or (node is not None and not pose.visible[node]):
                 continue
 
             tint = [1.0, 1.0, 1.0, mesh.base_alpha]
