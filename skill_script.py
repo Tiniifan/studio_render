@@ -20,7 +20,7 @@ an if on anything else keeps both branches.
 import re
 import zlib
 
-KINDS = {"atk": 3, "def": 3, "bal": 4, "eff": 3}
+KINDS = {"atk": 4, "def": 4, "bal": 4, "eff": 3}
 CALL = re.compile(r"\b(SetupNum|SetupEnable|SetupFrameEnable|SetupMotion)\s*\(([^()]*)\)")
 ROLE = re.compile(r"^(atk|def|bal|eff)([1-4])$|^(map|gol)$")
 
