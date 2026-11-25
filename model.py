@@ -70,7 +70,7 @@ class Mesh:
         self.index = 0
         self.positions = None
         self.normals = None
-        self.uv = [None, None]
+        self.uv = [None, None, None]     # UV sets 0, 1 and 2 (atr_tx0..2), v = 1 - v of the file
         self.tint = None
         self.flags = None       # the Col layer: per vertex outline flags (atr_pr2)
         self.weights = None
@@ -141,6 +141,31 @@ def _array(values, width, count, default):
     return np.tile(np.array(default, dtype=np.float32), (count, 1))
 
 
+def _third_uv(data):
+    """(N, 2) float32 UV set 2 of a mesh (attribute 6 of the XPVB, the atr_tx2 that #FIX_MDL and the archive vertex
+    programs read; studio_eleven's reader skips it), v = 1 - v of the file like the other sets, None without one."""
+    compressor = eleven.module("compression.compressor")
+    xprm = struct.unpack_from("<I", data, 4)[0]
+    if data[xprm:xprm + 4] != b"XPRM":
+        return None
+    xpvb_offset, xpvb_length = struct.unpack_from("<II", data, xprm + 4)
+    block = data[xprm + xpvb_offset:xprm + xpvb_offset + xpvb_length]
+    attribute_offset, fixed_offset, vertex_offset, stride = struct.unpack_from("<HHHH", block, 4)
+    count = struct.unpack_from("<I", block, 12)[0]
+    attributes = compressor.decompress(block[attribute_offset:fixed_offset])
+    components, offset, _, kind = attributes[24:28]
+    # Only a per vertex set (kind 2) of two floats or more is a UV set
+    if components < 2 or kind != 2:
+        return None
+    vertices = np.frombuffer(compressor.decompress(block[vertex_offset:]), dtype=np.uint8)
+    if len(vertices) < count * stride or offset + 8 > stride:
+        return None
+    rows = vertices[:count * stride].reshape(count, stride)
+    uv = np.ascontiguousarray(rows[:, offset:offset + 8]).view("<f4").reshape(count, 2).astype(np.float32)
+    uv[:, 1] = 1.0 - uv[:, 1]
+    return uv
+
+
 def _read_mesh(data, index, bone_index_of):
     parsed = eleven.xmpr().open_xmpr(io.BytesIO(data))
     mesh = Mesh()
@@ -162,6 +187,8 @@ def _read_mesh(data, index, bone_index_of):
     mesh.normals = _array(vertices["normals"], 3, count, (0.0, 1.0, 0.0))
     for unit, key in enumerate(("uv_data0", "uv_data1")):
         mesh.uv[unit] = np.array(vertices[key], dtype=np.float32).reshape(-1, 2) if vertices[key] else None
+    uv2 = _third_uv(data)
+    mesh.uv[2] = uv2 if uv2 is not None and len(uv2) == count else None
     mesh.tint = _array(vertices["tint_data"], 4, count, (1.0, 1.0, 1.0, 1.0))
     mesh.flags = np.array(vertices["color_data"], dtype=np.float32).reshape(-1, 4) if vertices["color_data"] else None
 

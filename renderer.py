@@ -8,15 +8,16 @@ the Blender gpu module did for StudioRender: buffers, textures, uniforms and the
 Differences with StudioRender inside Blender, because OpenGL can do what gpu.state of Blender 3.4 could not:
 - the blend factors and equations of the .atr are applied exactly (separate RGB / alpha), so the shader never applies
   a source factor itself;
-- the frame is blended in display space like the 3DS: textures are sRGB, the shader brings the samples back to their
-  stored values (gamma_correct) and writes display values (display_output), as StudioRender's F12 render does.
+- the frame holds the stored 8 bit values and the textures are uploaded as they are: the sampler filters, and the
+  combiner and the blend work on, the stored values like the PICA200, without any colour space conversion
+  (gamma_correct off). Blender's sRGB textures made the filtering run on linear values, which brightened the texels
+  mixed by the bilinear filter.
 """
 import numpy as np
 import moderngl
 
 import animation, eleven
 
-GL_SRGB8_ALPHA8 = 0x8C43
 MAX_TEXTURES = 4
 BUCKETS = 64
 MIN_ALPHA = 0.001
@@ -223,7 +224,7 @@ class GpuMesh:
             "atr_clr": (ctx.buffer(mesh.tint.astype("f4").tobytes()), "4f"),
             "atr_tx0": (ctx.buffer((mesh.uv[0] if mesh.uv[0] is not None else zeros).astype("f4").tobytes()), "2f"),
             "atr_tx1": (ctx.buffer((mesh.uv[1] if mesh.uv[1] is not None else zeros).astype("f4").tobytes()), "2f"),
-            "atr_tx2": (ctx.buffer(zeros.tobytes()), "2f"),
+            "atr_tx2": (ctx.buffer((mesh.uv[2] if mesh.uv[2] is not None else zeros).astype("f4").tobytes()), "2f"),
             "atr_pr2": (ctx.buffer((mesh.flags if mesh.flags is not None else np.zeros((count, 4), np.float32)).astype("f4").tobytes()), "4f"),
         }
         self.index = ctx.buffer(mesh.triangles.astype("u4").tobytes()) if len(mesh.triangles) else None
@@ -295,7 +296,7 @@ class Renderer:
         if key not in self.textures:
             rgba = mip_atlas(texture.rgba) if mip else texture.rgba
             height, width = rgba.shape[:2]
-            gl_texture = self.ctx.texture((width, height), 4, np.ascontiguousarray(rgba).tobytes(), internal_format=GL_SRGB8_ALPHA8)
+            gl_texture = self.ctx.texture((width, height), 4, np.ascontiguousarray(rgba).tobytes())
             gl_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
             gl_texture.repeat_x = gl_texture.repeat_y = False
             self.textures[key] = (gl_texture, texture)
@@ -490,8 +491,7 @@ class Renderer:
             light_count=light_count if lit else 0,
             alpha_test=resolved.alpha_test,
             alpha_func=resolved.alpha_func,
-            gamma_correct=True,
-            display_output=True,
+            gamma_correct=False,
         )
 
     @staticmethod
@@ -505,13 +505,17 @@ class Renderer:
         else:
             units = ()
         textured = len(units) > 0
+        # The samples are the stored values (gamma_correct off). StudioRender's flat outline (no texture, no merged
+        # program) converts its colour to scene linear unless display_output is on, which needs gamma_correct: it
+        # samples nothing, so both on write its colour unchanged
+        flat = base is None and not textured
         options = eleven.shaders().ShaderOptions(
             texture_units=units,
             alpha_test=textured and binding.state.alpha_test,
             alpha_func=binding.state.alpha_func if textured else None,
-            gamma_correct=True,
+            gamma_correct=flat,
             outline=True,
-            display_output=True,
+            display_output=flat,
         )
         return options, base
 
