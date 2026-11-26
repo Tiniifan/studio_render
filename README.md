@@ -158,6 +158,33 @@ Headless screenshot (for tests):
 python main.py cp0008a.xc uaa0219.xc ssa0114.xc --screenshot cp0008.png --size 500x700 --yaw 20
 ```
 
+### Renders of a technique without a window
+
+`studio_render_cli.exe headless` (`python cli.py headless` from the sources) opens a project, typically the
+HissatsuScene template, imports the `.pck` and the `.nut` (or `.nutb`) of a technique with the rules of the template
+and its automatic binding, and draws it with the game cameras. The project is never saved, no window opens, and no
+engine is installed: a missing engine is an error.
+
+```bash
+studio_render_cli.exe headless --capabilities
+studio_render_cli.exe headless frames HissatsuScene.srp --frames-dir frames --count 10 --seed 1 whs0001.pck whs0001.nut
+studio_render_cli.exe headless frames HissatsuScene.srp --frames-dir frames --frames 0,12,40 --failure-branch --size 400x240 whs0001.pck whs0001.nut
+studio_render_cli.exe headless mp4 HissatsuScene.srp --mp4 success.mp4 --failure failure.mp4 whs0001.pck whs0001.nut
+```
+
+* `frames` writes `frame_012.png`... in `--frames-dir` (made when missing): `--count N` frames spread over the
+  technique (one at random in each of N equal slices, `--seed` fixes the choice) or exactly the `--frames` given.
+  The success branch by default, `--failure-branch` for the other one. 400x240 by default (the 3DS top screen).
+* `mp4` writes the success branch to `--mp4` and, with `--failure`, the failure branch to that second file (800x480,
+  30 fps; existing files are replaced).
+* stdout carries only JSON lines, one per step, flushed at each line: `{"step": "import", "result": {...}}`,
+  `{"step": "frames", "frames": [3, 17, 30], "last": 84}`, `{"step": "frame", "index": 0, "frame": 3, "path": ...}`,
+  `{"step": "progress", "branch": "success", "done": 12, "total": 85}`,
+  `{"step": "exported", "branch": "success", "result": {...}}`, `{"step": "error", "code": ..., "message": ...}`.
+  `--capabilities` prints `{"headless": 1, "operations": ["frames", "mp4"], "version": ...}`. The logs go to stderr.
+* Exit codes: 0 done, 2 usage, 3 refused or failed (a file not taken by the template: `IMPORT_REFUSED`), 4 engine
+  not installed, 10 internal error.
+
 ## Squirrel scripts
 
 Windows tools to convert between `.nut` (source) and `.nutb` (compiled):
@@ -176,5 +203,6 @@ build_exe.bat
 ```
 
 Requires PyInstaller (`pip install pyinstaller`). Builds `out\<version>\studio_render\` and
-`out\<version>\studio_render.zip`. The build is a folder, not a single exe, so installed engines and
+`out\<version>\studio_render.zip`: `studio_render.exe` (the window) and `studio_render_cli.exe` (the console) side by
+side, sharing their `_internal` folder. The build is a folder, not a single exe, so installed engines and
 settings are preserved between launches.

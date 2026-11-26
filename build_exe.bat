@@ -1,5 +1,5 @@
 @echo off
-rem Builds studio_render.exe: out\<version>\studio_render\ and out\<version>\studio_render.zip (see tools\build_exe.py)
+rem Builds studio_render.exe and studio_render_cli.exe: out\<version>\studio_render\ and out\<version>\studio_render.zip (see tools\build_exe.py)
 setlocal
 cd /d "%~dp0"
 python -m PyInstaller --version >nul 2>&1
